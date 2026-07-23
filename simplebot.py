@@ -112,6 +112,7 @@ def category_keyboard():
     rows = []
     for index in range(0, len(CATEGORIES), 3):
         rows.append([{"text": item, "callback_data": f"category:{item}"} for item in CATEGORIES[index:index + 3]])
+    rows.append([{"text": "🤖 智能分类", "callback_data": "category:__auto__"}])
     rows.append([{"text": "取消", "callback_data": "home:home"}])
     return rows
 
@@ -304,7 +305,10 @@ def add_to_qbit(chat_id, user_id, category):
         return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接。", home_keyboard())
     magnet = pending["magnet"]
     before = {item["hash"] for item in task_list()}
-    qbit("/api/v2/torrents/add", {"urls": magnet, "category": category, "tags": "islandbot", "autoTMM": "false", "paused": "true"})
+    add_data = {"urls": magnet, "tags": "islandbot", "autoTMM": "false", "paused": "true"}
+    if category != "__auto__":
+        add_data["category"] = category
+    qbit("/api/v2/torrents/add", add_data)
     time.sleep(1)
     added = [item for item in task_list() if item["hash"] not in before]
     if not added:
