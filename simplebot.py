@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -146,6 +147,31 @@ def has_enough_space(item):
     return size <= max(0, free - RESERVE_GIB * GIB), size, free
 
 
+def google_drive_capacity():
+    """Read the configured Google Drive quota through MoviePilot's rclone remote."""
+    try:
+        result = subprocess.run(
+            ["rclone", "--config", "/rclone/rclone.conf", "about", "MP:"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "rclone about failed")
+        values = {}
+        for line in result.stdout.splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                values[key.strip()] = value.strip()
+        if not values.get("Total"):
+            raise RuntimeError("未返回配额")
+        return f"总 {values.get('Total', '—')} · 已用 {values.get('Used', '—')} · 可用 {values.get('Free', '—')}"
+    except Exception as exc:
+        print("google-drive-capacity error:", exc, flush=True)
+        return "暂时无法读取"
+
+
 def run_queue():
     """Keep exactly one IslandDownloadBot task downloading at a time."""
     global QUEUE_READY
@@ -249,15 +275,18 @@ def server_status(chat_id):
     download = info.get("dl_info_speed", 0) / 1024 / 1024
     upload = info.get("up_info_speed", 0) / 1024 / 1024
     active = sum(1 for item in tasks if item.get("progress", 0) < 1)
+    used = disk.total - disk.free
+    drive_capacity = google_drive_capacity()
     text = (
         "🖥 状态与设置\n\n"
         "服务：在线\n"
         "下载器：qBittorrent 已连接\n"
         f"下载速度：{download:.2f} MiB/s\n"
         f"上传速度：{upload:.2f} MiB/s\n"
-        f"活动任务：{active}\n"
-        f"可用空间：{disk.free / GIB:.1f} GB\n"
+        f"活动任务：{active}\n\n"
+        f"VPS 下载盘：总 {disk.total / GIB:.1f} GB · 已用 {used / GIB:.1f} GB · 可用 {disk.free / GIB:.1f} GB\n"
         f"安全预留：{RESERVE_GIB} GB\n\n"
+        f"Google Drive：{drive_capacity}\n\n"
         f"账号：管理员（{OWNER}）\n"
         "权限：下载、任务管理、服务器状态"
     )
