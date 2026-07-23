@@ -96,8 +96,7 @@ def answer(callback_id, text=None):
 def home_keyboard():
     return [
         [{"text": "➕ 添加下载", "callback_data": "home:add"}, {"text": "📋 我的任务", "callback_data": "home:tasks"}],
-        [{"text": "🖥 服务器状态", "callback_data": "home:server"}, {"text": "👤 账号与权限", "callback_data": "home:account"}],
-        [{"text": "❔ 使用帮助", "callback_data": "home:help"}],
+        [{"text": "🖥 状态与设置", "callback_data": "home:server"}],
     ]
 
 
@@ -111,7 +110,7 @@ def category_keyboard():
 
 def home(chat_id, first_name=""):
     greeting = f"你好，{first_name}。" if first_name else "你好。"
-    send(chat_id, f"{greeting}\n\nIsland Download 是你的私人媒体下载台。\n选择操作，或直接发送 magnet 链接。", home_keyboard())
+    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接，或选择操作。", home_keyboard())
 
 
 def task_list():
@@ -124,14 +123,14 @@ def show_tasks(chat_id):
         return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接。", home_keyboard())
     lines = []
     buttons = []
-    for item in tasks[:10]:
+    for item in tasks[:6]:
         short_hash = item["hash"][:8]
         progress = item.get("progress", 0) * 100
         state = item.get("state", "未知")
         category = item.get("category") or "未分类"
         lines.append(f"{short_hash} · {progress:.0f}% · {state}\n{item.get('name', '')[:42]}\n{category}")
-        buttons.append([{"text": f"管理 {short_hash}", "callback_data": f"task:{short_hash}"}])
-    buttons.append([{"text": "刷新", "callback_data": "home:tasks"}, {"text": "返回主页", "callback_data": "home:home"}])
+        buttons.append([{"text": f"查看 {short_hash}", "callback_data": f"task:{short_hash}"}])
+    buttons.append([{"text": "← 主菜单", "callback_data": "home:home"}])
     send(chat_id, "📋 下载任务\n\n" + "\n\n".join(lines), buttons)
 
 
@@ -158,7 +157,7 @@ def show_task(chat_id, short_hash):
     action = "pause" if running else "resume"
     keyboard = [
         [{"text": control, "callback_data": f"action:{action}:{short_hash}"}, {"text": "删除", "callback_data": f"deleteask:{short_hash}"}],
-        [{"text": "返回任务", "callback_data": "home:tasks"}, {"text": "主页", "callback_data": "home:home"}],
+        [{"text": "← 任务列表", "callback_data": "home:tasks"}],
     ]
     send(chat_id, text, keyboard)
 
@@ -171,23 +170,17 @@ def server_status(chat_id):
     upload = info.get("up_info_speed", 0) / 1024 / 1024
     active = sum(1 for item in tasks if item.get("progress", 0) < 1)
     text = (
-        "🖥 服务器状态\n\n"
+        "🖥 状态与设置\n\n"
         "服务：在线\n"
         "下载器：qBittorrent 已连接\n"
         f"下载速度：{download:.2f} MiB/s\n"
         f"上传速度：{upload:.2f} MiB/s\n"
         f"活动任务：{active}\n"
-        f"完成目录可用空间：{disk.free / 1024 / 1024 / 1024:.1f} GB"
+        f"可用空间：{disk.free / 1024 / 1024 / 1024:.1f} GB\n\n"
+        f"账号：管理员（{OWNER}）\n"
+        "权限：下载、任务管理、服务器状态"
     )
-    send(chat_id, text, [[{"text": "刷新", "callback_data": "home:server"}, {"text": "返回主页", "callback_data": "home:home"}]])
-
-
-def account(chat_id):
-    send(chat_id, f"👤 账号与权限\n\n你的 Telegram ID：{OWNER}\n角色：系统管理员\n权限：下载、任务管理、服务器状态\n\n此机器人目前为私有模式，未授权用户无法操作。", [[{"text": "返回主页", "callback_data": "home:home"}]])
-
-
-def help_text(chat_id):
-    send(chat_id, "❔ 使用方法\n\n1. 点击“添加下载”，发送 magnet 链接。\n2. 点击影视分类。\n3. qBittorrent 下载完成后，MoviePilot 自动识别、改名、上传 Google Drive。\n4. 成功上传后清理 VPS 源文件。\n\n也可用：\n/tasks 查看任务\n/pause 哈希前8位\n/resume 哈希前8位\n/delete 哈希前8位", [[{"text": "返回主页", "callback_data": "home:home"}]])
+    send(chat_id, text, [[{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}]])
 
 
 def add_magnet(chat_id, user_id, magnet):
@@ -225,6 +218,12 @@ def handle_callback(callback):
     answer(callback["id"])
     if user_id != OWNER:
         return
+    # Telegram has no native single-page UI. Remove the previous bot card before
+    # rendering the next one, so the conversation stays clean and app-like.
+    try:
+        telegram("deleteMessage", {"chat_id": chat_id, "message_id": callback["message"]["message_id"]})
+    except Exception:
+        pass
     data = callback.get("data", "")
     if data == "home:home":
         return home(chat_id, callback["from"].get("first_name", ""))
@@ -234,10 +233,6 @@ def handle_callback(callback):
         return show_tasks(chat_id)
     if data == "home:server":
         return server_status(chat_id)
-    if data == "home:account":
-        return account(chat_id)
-    if data == "home:help":
-        return help_text(chat_id)
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
     if data.startswith("task:"):
@@ -275,7 +270,7 @@ def handle(update):
     if text in {"/start", "/menu"}:
         return home(chat_id, message["from"].get("first_name", ""))
     if text == "/help":
-        return help_text(chat_id)
+        return send(chat_id, "发送 magnet 链接后选择分类。\n下载完成后由 MoviePilot 自动整理并上传。\n\n/tasks 可查看任务。")
     if legacy_command(chat_id, text):
         return
     send(chat_id, "请点击 /start 打开菜单，或直接发送 magnet 链接。")
