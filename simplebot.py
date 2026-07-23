@@ -28,6 +28,8 @@ BLOCKED_FILE = DATA_DIR / "blocked.json"
 BLOCKED = set(json.loads(BLOCKED_FILE.read_text())) if BLOCKED_FILE.exists() else set()
 RESERVE_GIB = int(os.environ.get("MIN_FREE_GIB", "10"))
 GIB = 1024 * 1024 * 1024
+EXPIRY_FILE = DATA_DIR / "expiry.json"
+EXPIRING = list(json.loads(EXPIRY_FILE.read_text())) if EXPIRY_FILE.exists() else []
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 
@@ -91,7 +93,31 @@ def send(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": text}
     if keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard}, ensure_ascii=False)
-    telegram("sendMessage", payload)
+    return telegram("sendMessage", payload)
+
+
+def send_temporary(chat_id, text, lifetime_seconds=300):
+    response = send(chat_id, text)
+    message_id = response.get("result", {}).get("message_id")
+    if message_id:
+        EXPIRING.append({"chat_id": chat_id, "message_id": message_id, "delete_at": time.time() + lifetime_seconds})
+        EXPIRY_FILE.write_text(json.dumps(EXPIRING))
+
+
+def delete_expired_messages():
+    now = time.time()
+    remaining = []
+    for item in EXPIRING:
+        if item["delete_at"] > now:
+            remaining.append(item)
+            continue
+        try:
+            telegram("deleteMessage", {"chat_id": item["chat_id"], "message_id": item["message_id"]})
+        except Exception as exc:
+            print("delete-expired-message error:", exc, flush=True)
+    if len(remaining) != len(EXPIRING):
+        EXPIRING[:] = remaining
+        EXPIRY_FILE.write_text(json.dumps(EXPIRING))
 
 
 def answer(callback_id, text=None):
@@ -429,7 +455,7 @@ def watch_completed():
             continue
         SEEN.add(item["hash"])
         DONE_FILE.write_text(json.dumps(list(SEEN)))
-        send(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '未分类'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
+        send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '未分类'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
     run_queue()
 
 
@@ -439,6 +465,7 @@ while True:
         for update in updates.get("result", []):
             handle(update)
         watch_completed()
+        delete_expired_messages()
     except Exception as exc:
         print("error:", exc, flush=True)
         time.sleep(5)
