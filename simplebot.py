@@ -13,6 +13,8 @@ OWNER = int(os.environ["OWNER_ID"])
 QBIT_URL = os.environ.get("QBIT_URL", "http://qbittorrent:8080").rstrip("/")
 QBIT_USER = os.environ["QBIT_USERNAME"]
 QBIT_PASSWORD = os.environ["QBIT_PASSWORD"]
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
 COOKIE = ""
 OFFSET = 0
 PENDING = {}
@@ -44,6 +46,49 @@ def request(url, data=None, headers=None):
         return exc.code, exc.read().decode(errors="replace"), exc.headers
     except Exception as exc:
         return 599, str(exc), {}
+
+
+def json_request(url, payload, timeout=100):
+    try:
+        req = urllib.request.Request(
+            url,
+            json.dumps(payload, ensure_ascii=False).encode(),
+            {"Content-Type": "application/json"},
+        )
+        response = urllib.request.urlopen(req, timeout=timeout)
+        return response.status, response.read().decode(), response.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode(errors="replace"), exc.headers
+    except Exception as exc:
+        return 599, str(exc), {}
+
+
+def ai_reply(question):
+    system = (
+        "你是 IslandDownload 的私人中文助手。回答简洁、实用，不超过 120 个汉字。"
+        "你可以解释下载队列、MoviePilot、Emby、Google Drive、VPS 日志和媒体整理。"
+        "你没有执行删除、下载、重启的权限；涉及这些操作时说明需要用户通过机器人按钮确认。"
+        "不知道实时数据时明确说请点击“状态与设置”或“我的任务”，不要编造。"
+    )
+    status, body, _ = json_request(
+        f"{OLLAMA_URL}/api/chat",
+        {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "think": False,
+            "keep_alive": "5m",
+            "options": {"temperature": 0.2, "num_predict": 220},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": question}],
+        },
+    )
+    if status >= 300:
+        print("ollama error:", body[:300], flush=True)
+        return "AI 暂时不可用，请稍后再试。"
+    try:
+        answer_text = json.loads(body)["message"]["content"].strip()
+        return answer_text or "AI 没有返回内容，请换一种问法。"
+    except Exception:
+        return "AI 返回格式异常，请稍后再试。"
 
 
 def qbit_login():
@@ -145,7 +190,7 @@ def category_keyboard():
 
 def home(chat_id, first_name=""):
     greeting = f"你好，{first_name}。" if first_name else "你好。"
-    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接，或选择操作。", home_keyboard())
+    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接，或选择操作。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
 
 
 def task_list():
@@ -445,7 +490,7 @@ def handle(update):
         return send(chat_id, "发送 magnet 链接后选择分类。\n下载完成后由 MoviePilot 自动整理并上传。\n\n/tasks 可查看任务。")
     if legacy_command(chat_id, text):
         return
-    send(chat_id, "请点击 /start 打开菜单，或直接发送 magnet 链接。")
+    send(chat_id, ai_reply(text))
 
 
 def watch_completed():
