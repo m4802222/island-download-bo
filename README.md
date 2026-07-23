@@ -10,6 +10,7 @@
 - 显示 qBittorrent 实时上传/下载速度和完成目录可用空间
 - 自动兼容 qBittorrent 5 的 HTTP 204 登录响应；会话过期自动重连，短暂网络失败自动重试
 - 下载完成提醒；后续由 MoviePilot 监控下载器，自动识别、命名、上传 Google Drive 并清理源文件
+- 顺序下载队列：同一时间只下载一个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
 
 ## 部署
 
@@ -24,3 +25,5 @@ docker run -d --name island-download-bot --network media-net --restart unless-st
 ```
 
 `.env` 不应上传至 GitHub。
+
+`MIN_FREE_GIB` 可调整下载目录的安全预留空间，默认值为 `10`。

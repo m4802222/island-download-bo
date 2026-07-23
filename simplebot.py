@@ -23,6 +23,10 @@ SEEN = set(json.loads(DONE_FILE.read_text())) if DONE_FILE.exists() else set()
 QUEUE_FILE = DATA_DIR / "queue.json"
 QUEUE = list(json.loads(QUEUE_FILE.read_text())) if QUEUE_FILE.exists() else []
 QUEUE_READY = QUEUE_FILE.exists()
+BLOCKED_FILE = DATA_DIR / "blocked.json"
+BLOCKED = set(json.loads(BLOCKED_FILE.read_text())) if BLOCKED_FILE.exists() else set()
+RESERVE_GIB = int(os.environ.get("MIN_FREE_GIB", "10"))
+GIB = 1024 * 1024 * 1024
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 
@@ -124,6 +128,24 @@ def save_queue():
     QUEUE_FILE.write_text(json.dumps(QUEUE))
 
 
+def save_blocked():
+    BLOCKED_FILE.write_text(json.dumps(list(BLOCKED)))
+
+
+def file_size(item):
+    return int(item.get("total_size") or item.get("size") or 0)
+
+
+def has_enough_space(item):
+    """Return whether the next download fits, with a fixed safety reserve."""
+    size = file_size(item)
+    if size <= 0:
+        # A magnet can need a short metadata phase before qBittorrent knows size.
+        return True, size, shutil.disk_usage("/downloads").free
+    free = shutil.disk_usage("/downloads").free
+    return size <= max(0, free - RESERVE_GIB * GIB), size, free
+
+
 def run_queue():
     """Keep exactly one IslandDownloadBot task downloading at a time."""
     global QUEUE_READY
@@ -138,6 +160,10 @@ def run_queue():
     # Finished or deleted tasks no longer block the next download.
     QUEUE[:] = [task_hash for task_hash in QUEUE if task_hash in task_by_hash and task_by_hash[task_hash].get("progress", 0) < 1]
     save_queue()
+    stale_blocked = BLOCKED - set(QUEUE)
+    if stale_blocked:
+        BLOCKED.difference_update(stale_blocked)
+        save_blocked()
     if not QUEUE:
         return
 
@@ -148,7 +174,21 @@ def run_queue():
         if item and item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
             qbit("/api/v2/torrents/pause", {"hashes": task_hash})
     item = task_by_hash.get(current)
-    if item and item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+    if not item:
+        return
+    fits, size, free = has_enough_space(item)
+    if not fits:
+        if item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+            qbit("/api/v2/torrents/pause", {"hashes": current})
+        if current not in BLOCKED:
+            BLOCKED.add(current)
+            save_blocked()
+            send(OWNER, f"⚠️ 队列暂停：空间不足\n\n{item.get('name', '')[:55]}\n资源大小：{size / GIB:.1f} GB\n当前可用：{free / GIB:.1f} GB\n安全预留：{RESERVE_GIB} GB\n\n等待 MoviePilot 上传并清理文件后，将自动继续。")
+        return
+    if current in BLOCKED:
+        BLOCKED.remove(current)
+        save_blocked()
+    if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
         qbit("/api/v2/torrents/resume", {"hashes": current})
 
 
@@ -216,7 +256,8 @@ def server_status(chat_id):
         f"下载速度：{download:.2f} MiB/s\n"
         f"上传速度：{upload:.2f} MiB/s\n"
         f"活动任务：{active}\n"
-        f"可用空间：{disk.free / 1024 / 1024 / 1024:.1f} GB\n\n"
+        f"可用空间：{disk.free / GIB:.1f} GB\n"
+        f"安全预留：{RESERVE_GIB} GB\n\n"
         f"账号：管理员（{OWNER}）\n"
         "权限：下载、任务管理、服务器状态"
     )
@@ -243,7 +284,9 @@ def add_to_qbit(chat_id, user_id, category):
     save_queue()
     run_queue()
     position = QUEUE.index(new_task["hash"]) + 1 if new_task["hash"] in QUEUE else 1
-    send(chat_id, f"已加入下载队列\n分类：{category}\n队列位置：{position}\n\n完成后会自动交给 MoviePilot 整理。", home_keyboard())
+    fits, size, free = has_enough_space(new_task)
+    capacity = "正在获取资源大小" if size <= 0 else ("空间检查通过" if fits else f"等待空间（可用 {free / GIB:.1f} GB）")
+    send(chat_id, f"已加入下载队列\n分类：{category}\n队列位置：{position}\n空间状态：{capacity}\n\n完成后会自动交给 MoviePilot 整理。", home_keyboard())
 
 
 def legacy_command(chat_id, text):
