@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -29,22 +30,32 @@ def request(url, data=None, headers=None):
         req = urllib.request.Request(url, body, headers or {})
         response = urllib.request.urlopen(req, timeout=40)
         return response.status, response.read().decode(), response.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode(errors="replace"), exc.headers
     except Exception as exc:
         return 599, str(exc), {}
 
 
 def qbit_login():
     global COOKIE
-    status, _, headers = request(
-        f"{QBIT_URL}/api/v2/auth/login",
-        {"username": QBIT_USER, "password": QBIT_PASSWORD},
-    )
-    # qBittorrent 5 returns 204 for a successful empty response.
-    if status not in (200, 204):
-        raise RuntimeError("qBittorrent 登录失败")
-    COOKIE = headers.get("Set-Cookie", "").split(";", 1)[0]
-    if not COOKIE:
-        raise RuntimeError("qBittorrent 未返回登录会话")
+    last_status = 0
+    # qBittorrent 5 returns HTTP 204 for a successful empty login response.
+    # Retry transient network/container-startup failures without leaking credentials.
+    for attempt in range(3):
+        status, _, headers = request(
+            f"{QBIT_URL}/api/v2/auth/login",
+            {"username": QBIT_USER, "password": QBIT_PASSWORD},
+        )
+        last_status = status
+        if status in (200, 204):
+            COOKIE = headers.get("Set-Cookie", "").split(";", 1)[0]
+            if COOKIE:
+                return
+        if attempt < 2:
+            time.sleep(attempt + 1)
+    if last_status in (401, 403):
+        raise RuntimeError("qBittorrent 账号或密码被拒绝")
+    raise RuntimeError(f"qBittorrent 登录失败（HTTP {last_status}）")
 
 
 def qbit(path, data=None):
@@ -52,7 +63,8 @@ def qbit(path, data=None):
     if not COOKIE:
         qbit_login()
     status, body, _ = request(f"{QBIT_URL}{path}", data, {"Cookie": COOKIE})
-    if status == 403:
+    if status in (401, 403):
+        COOKIE = ""
         qbit_login()
         status, body, _ = request(f"{QBIT_URL}{path}", data, {"Cookie": COOKIE})
     if status >= 300:
