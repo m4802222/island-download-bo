@@ -490,6 +490,10 @@ def handle(update):
         return send(chat_id, "发送 magnet 链接后选择分类。\n下载完成后由 MoviePilot 自动整理并上传。\n\n/tasks 可查看任务。")
     if legacy_command(chat_id, text):
         return
+    if any(word in text for word in ("空间", "硬盘", "云盘", "容量", "服务器状态")):
+        return server_status(chat_id)
+    if any(word in text for word in ("任务", "队列", "下载进度")):
+        return show_tasks(chat_id)
     send(chat_id, ai_reply(text))
 
 
