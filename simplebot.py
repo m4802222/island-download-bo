@@ -20,6 +20,9 @@ DATA_DIR = Path("/data")
 DATA_DIR.mkdir(exist_ok=True)
 DONE_FILE = DATA_DIR / "done.json"
 SEEN = set(json.loads(DONE_FILE.read_text())) if DONE_FILE.exists() else set()
+QUEUE_FILE = DATA_DIR / "queue.json"
+QUEUE = list(json.loads(QUEUE_FILE.read_text())) if QUEUE_FILE.exists() else []
+QUEUE_READY = QUEUE_FILE.exists()
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 
@@ -117,6 +120,38 @@ def task_list():
     return json.loads(qbit("/api/v2/torrents/info?tag=islandbot&sort=added_on&reverse=true"))
 
 
+def save_queue():
+    QUEUE_FILE.write_text(json.dumps(QUEUE))
+
+
+def run_queue():
+    """Keep exactly one IslandDownloadBot task downloading at a time."""
+    global QUEUE_READY
+    tasks = task_list()
+    task_by_hash = {item["hash"]: item for item in tasks}
+
+    # First upgrade: put pre-existing unfinished bot tasks into the same queue.
+    if not QUEUE_READY:
+        QUEUE.extend(item["hash"] for item in sorted(tasks, key=lambda item: item.get("added_on", 0)) if item.get("progress", 0) < 1)
+        QUEUE_READY = True
+
+    # Finished or deleted tasks no longer block the next download.
+    QUEUE[:] = [task_hash for task_hash in QUEUE if task_hash in task_by_hash and task_by_hash[task_hash].get("progress", 0) < 1]
+    save_queue()
+    if not QUEUE:
+        return
+
+    current = QUEUE[0]
+    # Every later item stays paused, even after a container restart.
+    for task_hash in QUEUE[1:]:
+        item = task_by_hash.get(task_hash)
+        if item and item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+            qbit("/api/v2/torrents/pause", {"hashes": task_hash})
+    item = task_by_hash.get(current)
+    if item and item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+        qbit("/api/v2/torrents/resume", {"hashes": current})
+
+
 def show_tasks(chat_id):
     tasks = task_list()
     if not tasks:
@@ -128,7 +163,8 @@ def show_tasks(chat_id):
         progress = item.get("progress", 0) * 100
         state = item.get("state", "未知")
         category = item.get("category") or "未分类"
-        lines.append(f"{short_hash} · {progress:.0f}% · {state}\n{item.get('name', '')[:42]}\n{category}")
+        position = QUEUE.index(item["hash"]) + 1 if item["hash"] in QUEUE else "—"
+        lines.append(f"队列 {position} · {progress:.0f}% · {state}\n{item.get('name', '')[:42]}\n{category}")
         buttons.append([{"text": f"查看 {short_hash}", "callback_data": f"task:{short_hash}"}])
     buttons.append([{"text": "← 主菜单", "callback_data": "home:home"}])
     send(chat_id, "📋 下载任务\n\n" + "\n\n".join(lines), buttons)
@@ -196,8 +232,18 @@ def add_to_qbit(chat_id, user_id, category):
     magnet = PENDING.pop(user_id, None)
     if not magnet:
         return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接。", home_keyboard())
-    qbit("/api/v2/torrents/add", {"urls": magnet, "category": category, "tags": "islandbot", "autoTMM": "false"})
-    send(chat_id, f"已加入下载队列\n分类：{category}\n\n完成后会自动交给 MoviePilot 整理。", home_keyboard())
+    before = {item["hash"] for item in task_list()}
+    qbit("/api/v2/torrents/add", {"urls": magnet, "category": category, "tags": "islandbot", "autoTMM": "false", "paused": "true"})
+    time.sleep(1)
+    added = [item for item in task_list() if item["hash"] not in before]
+    if not added:
+        return send(chat_id, "未能确认新任务，请在“我的任务”中检查。", home_keyboard())
+    new_task = max(added, key=lambda item: item.get("added_on", 0))
+    QUEUE.append(new_task["hash"])
+    save_queue()
+    run_queue()
+    position = QUEUE.index(new_task["hash"]) + 1 if new_task["hash"] in QUEUE else 1
+    send(chat_id, f"已加入下载队列\n分类：{category}\n队列位置：{position}\n\n完成后会自动交给 MoviePilot 整理。", home_keyboard())
 
 
 def legacy_command(chat_id, text):
@@ -212,6 +258,13 @@ def legacy_command(chat_id, text):
         return True
     command = parts[0][1:]
     qbit(f"/api/v2/torrents/{command}", {"hashes": item["hash"], **({"deleteFiles": "true"} if command == "delete" else {})})
+    if command in {"pause", "delete"} and item["hash"] in QUEUE:
+        QUEUE.remove(item["hash"])
+        save_queue()
+    elif command == "resume" and item.get("progress", 0) < 1 and item["hash"] not in QUEUE:
+        QUEUE.append(item["hash"])
+        save_queue()
+    run_queue()
     send(chat_id, f"已{ '删除' if command == 'delete' else ('暂停' if command == 'pause' else '继续') }：{item.get('name', '')[:45]}")
     return True
 
@@ -247,6 +300,13 @@ def handle_callback(callback):
         if not item:
             return send(chat_id, "任务不存在。", home_keyboard())
         qbit(f"/api/v2/torrents/{action}", {"hashes": item["hash"]})
+        if action == "pause" and item["hash"] in QUEUE:
+            QUEUE.remove(item["hash"])
+            save_queue()
+        elif action == "resume" and item.get("progress", 0) < 1 and item["hash"] not in QUEUE:
+            QUEUE.append(item["hash"])
+            save_queue()
+        run_queue()
         return show_task(chat_id, short_hash)
     if data.startswith("deleteask:"):
         short_hash = data.split(":", 1)[1]
@@ -256,6 +316,10 @@ def handle_callback(callback):
         if not item:
             return send(chat_id, "任务不存在。", home_keyboard())
         qbit("/api/v2/torrents/delete", {"hashes": item["hash"], "deleteFiles": "true"})
+        if item["hash"] in QUEUE:
+            QUEUE.remove(item["hash"])
+            save_queue()
+        run_queue()
         return send(chat_id, "任务及 VPS 文件已删除。", home_keyboard())
 
 
@@ -288,6 +352,7 @@ def watch_completed():
         SEEN.add(item["hash"])
         DONE_FILE.write_text(json.dumps(list(SEEN)))
         send(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '未分类'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
+    run_queue()
 
 
 while True:
