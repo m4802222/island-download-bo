@@ -163,9 +163,13 @@ def show_task(chat_id, short_hash):
 
 
 def server_status(chat_id):
-    info = json.loads(qbit("/api/v2/transfer/info"))
-    tasks = task_list()
-    disk = shutil.disk_usage("/downloads")
+    try:
+        info = json.loads(qbit("/api/v2/transfer/info"))
+        tasks = task_list()
+        disk = shutil.disk_usage("/downloads")
+    except Exception as exc:
+        print("server-status error:", exc, flush=True)
+        return send(chat_id, "🖥 状态暂时无法读取。\n请稍后点击 /start 再试。", [[{"text": "← 主菜单", "callback_data": "home:home"}]])
     download = info.get("dl_info_speed", 0) / 1024 / 1024
     upload = info.get("up_info_speed", 0) / 1024 / 1024
     active = sum(1 for item in tasks if item.get("progress", 0) < 1)
