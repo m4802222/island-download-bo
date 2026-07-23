@@ -264,15 +264,16 @@ def server_status(chat_id):
     send(chat_id, text, [[{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}]])
 
 
-def add_magnet(chat_id, user_id, magnet):
-    PENDING[user_id] = magnet
+def add_magnet(chat_id, user_id, magnet, source_message_id):
+    PENDING[user_id] = {"magnet": magnet, "source_message_id": source_message_id}
     send(chat_id, "选择影视分类：", category_keyboard())
 
 
 def add_to_qbit(chat_id, user_id, category):
-    magnet = PENDING.pop(user_id, None)
-    if not magnet:
+    pending = PENDING.pop(user_id, None)
+    if not pending:
         return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接。", home_keyboard())
+    magnet = pending["magnet"]
     before = {item["hash"] for item in task_list()}
     qbit("/api/v2/torrents/add", {"urls": magnet, "category": category, "tags": "islandbot", "autoTMM": "false", "paused": "true"})
     time.sleep(1)
@@ -283,10 +284,11 @@ def add_to_qbit(chat_id, user_id, category):
     QUEUE.append(new_task["hash"])
     save_queue()
     run_queue()
-    position = QUEUE.index(new_task["hash"]) + 1 if new_task["hash"] in QUEUE else 1
-    fits, size, free = has_enough_space(new_task)
-    capacity = "正在获取资源大小" if size <= 0 else ("空间检查通过" if fits else f"等待空间（可用 {free / GIB:.1f} GB）")
-    send(chat_id, f"已加入下载队列\n分类：{category}\n队列位置：{position}\n空间状态：{capacity}\n\n完成后会自动交给 MoviePilot 整理。", home_keyboard())
+    # Keep private magnets out of chat history once their category is chosen.
+    try:
+        telegram("deleteMessage", {"chat_id": chat_id, "message_id": pending["source_message_id"]})
+    except Exception as exc:
+        print("delete-magnet error:", exc, flush=True)
 
 
 def legacy_command(chat_id, text):
@@ -377,7 +379,7 @@ def handle(update):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
     if text.startswith("magnet:?xt=urn:btih:"):
-        return add_magnet(chat_id, OWNER, text)
+        return add_magnet(chat_id, OWNER, text, message["message_id"])
     if text in {"/start", "/menu"}:
         return home(chat_id, message["from"].get("first_name", ""))
     if text == "/help":
