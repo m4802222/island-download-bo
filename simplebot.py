@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -32,6 +33,9 @@ RESERVE_GIB = int(os.environ.get("MIN_FREE_GIB", "10"))
 GIB = 1024 * 1024 * 1024
 EXPIRY_FILE = DATA_DIR / "expiry.json"
 EXPIRING = list(json.loads(EXPIRY_FILE.read_text())) if EXPIRY_FILE.exists() else []
+INCOMING_DIR = DATA_DIR / "incoming"
+INCOMING_DIR.mkdir(exist_ok=True)
+MAX_TORRENT_BYTES = 20 * 1024 * 1024
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 
@@ -46,6 +50,18 @@ def request(url, data=None, headers=None):
         return exc.code, exc.read().decode(errors="replace"), exc.headers
     except Exception as exc:
         return 599, str(exc), {}
+
+
+def raw_request(url, body=None, headers=None, timeout=40):
+    """Send binary bodies, used for qBittorrent torrent-file uploads."""
+    try:
+        req = urllib.request.Request(url, body, headers or {})
+        response = urllib.request.urlopen(req, timeout=timeout)
+        return response.status, response.read(), response.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), exc.headers
+    except Exception as exc:
+        return 599, str(exc).encode(), {}
 
 
 def json_request(url, payload, timeout=100):
@@ -127,6 +143,41 @@ def qbit(path, data=None):
     return body
 
 
+def qbit_add_torrent_file(filename, content, category):
+    """Upload a .torrent file to qBittorrent using its multipart API."""
+    global COOKIE
+    boundary = f"----IslandDownload{uuid.uuid4().hex}"
+    body = bytearray()
+
+    def field(name, value):
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(str(value).encode())
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}\r\n".encode())
+    safe_name = Path(filename).name.replace('"', "_")
+    body.extend(f'Content-Disposition: form-data; name="torrents"; filename="{safe_name}"\r\n'.encode())
+    body.extend(b"Content-Type: application/x-bittorrent\r\n\r\n")
+    body.extend(content)
+    body.extend(b"\r\n")
+    field("tags", "islandbot")
+    field("autoTMM", "false")
+    field("paused", "true")
+    if category != "__auto__":
+        field("category", category)
+    body.extend(f"--{boundary}--\r\n".encode())
+    headers = {"Cookie": COOKIE, "Content-Type": f"multipart/form-data; boundary={boundary}"}
+    status, response, _ = raw_request(f"{QBIT_URL}/api/v2/torrents/add", bytes(body), headers)
+    if status in (401, 403):
+        COOKIE = ""
+        qbit_login()
+        headers["Cookie"] = COOKIE
+        status, response, _ = raw_request(f"{QBIT_URL}/api/v2/torrents/add", bytes(body), headers)
+    if status >= 300:
+        raise RuntimeError(response.decode(errors="replace")[:180])
+
+
 def telegram(method, data):
     status, body, _ = request(f"https://api.telegram.org/bot{TOKEN}/{method}", data)
     if status >= 300:
@@ -190,7 +241,7 @@ def category_keyboard():
 
 def home(chat_id, first_name=""):
     greeting = f"你好，{first_name}。" if first_name else "你好。"
-    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接，或选择操作。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
+    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接或 .torrent 文件。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
 
 
 def task_list():
@@ -293,7 +344,7 @@ def run_queue():
 def show_tasks(chat_id):
     tasks = task_list()
     if not tasks:
-        return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接。", home_keyboard())
+        return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接、.torrent 文件。", home_keyboard())
     lines = []
     buttons = []
     for item in tasks[:6]:
@@ -366,33 +417,78 @@ def server_status(chat_id):
 
 
 def add_magnet(chat_id, user_id, magnet, source_message_id):
+    old = PENDING.get(user_id)
+    if old and old.get("torrent_path"):
+        Path(old["torrent_path"]).unlink(missing_ok=True)
     PENDING[user_id] = {"magnet": magnet, "source_message_id": source_message_id}
     send(chat_id, "选择影视分类：", category_keyboard())
 
 
+def download_telegram_file(file_id):
+    details = telegram("getFile", {"file_id": file_id}).get("result", {})
+    file_path = details.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram 未返回文件路径")
+    status, content, _ = raw_request(f"https://api.telegram.org/file/bot{TOKEN}/{file_path}", timeout=60)
+    if status >= 300:
+        raise RuntimeError("Telegram 文件下载失败")
+    return content
+
+
+def add_torrent_file(chat_id, user_id, document, source_message_id):
+    filename = document.get("file_name") or "download.torrent"
+    size = int(document.get("file_size") or 0)
+    if not filename.lower().endswith(".torrent"):
+        return send(chat_id, "只支持 .torrent 种子文件。请发送磁力链接或种子文件。", home_keyboard())
+    if size <= 0 or size > MAX_TORRENT_BYTES:
+        return send(chat_id, "种子文件无效或超过 20MB，无法从 Telegram 获取。", home_keyboard())
+    try:
+        content = download_telegram_file(document["file_id"])
+    except Exception as exc:
+        print("telegram-file error:", exc, flush=True)
+        return send(chat_id, "种子文件读取失败，请重新发送。", home_keyboard())
+    if not content.startswith(b"d"):
+        return send(chat_id, "这个文件不是有效的 BitTorrent 种子文件。", home_keyboard())
+    old = PENDING.get(user_id)
+    if old and old.get("torrent_path"):
+        Path(old["torrent_path"]).unlink(missing_ok=True)
+    stored = INCOMING_DIR / f"{user_id}-{uuid.uuid4().hex}.torrent"
+    stored.write_bytes(content)
+    PENDING[user_id] = {"torrent_path": str(stored), "filename": filename, "source_message_id": source_message_id}
+    send(chat_id, f"已收到种子文件：{filename[:48]}\n\n选择影视分类：", category_keyboard())
+
+
 def add_to_qbit(chat_id, user_id, category):
-    pending = PENDING.pop(user_id, None)
+    pending = PENDING.get(user_id)
     if not pending:
-        return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接。", home_keyboard())
-    magnet = pending["magnet"]
+        return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接或 .torrent 文件。", home_keyboard())
     before = {item["hash"] for item in task_list()}
-    add_data = {"urls": magnet, "tags": "islandbot", "autoTMM": "false", "paused": "true"}
-    if category != "__auto__":
-        add_data["category"] = category
-    qbit("/api/v2/torrents/add", add_data)
+    if "magnet" in pending:
+        add_data = {"urls": pending["magnet"], "tags": "islandbot", "autoTMM": "false", "paused": "true"}
+        if category != "__auto__":
+            add_data["category"] = category
+        qbit("/api/v2/torrents/add", add_data)
+    else:
+        source = Path(pending["torrent_path"])
+        if not source.exists():
+            return send(chat_id, "种子文件已失效，请重新发送。", home_keyboard())
+        qbit_add_torrent_file(pending["filename"], source.read_bytes(), category)
     time.sleep(1)
     added = [item for item in task_list() if item["hash"] not in before]
     if not added:
         return send(chat_id, "未能确认新任务，请在“我的任务”中检查。", home_keyboard())
+    PENDING.pop(user_id, None)
+    if pending.get("torrent_path"):
+        Path(pending["torrent_path"]).unlink(missing_ok=True)
     new_task = max(added, key=lambda item: item.get("added_on", 0))
     QUEUE.append(new_task["hash"])
     save_queue()
     run_queue()
-    # Keep private magnets out of chat history once their category is chosen.
+    # Keep private magnets and torrent files out of chat history once selected.
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": pending["source_message_id"]})
     except Exception as exc:
-        print("delete-magnet error:", exc, flush=True)
+        print("delete-source-message error:", exc, flush=True)
 
 
 def legacy_command(chat_id, text):
@@ -434,7 +530,7 @@ def handle_callback(callback):
     if data == "home:home":
         return home(chat_id, callback["from"].get("first_name", ""))
     if data == "home:add":
-        return send(chat_id, "请直接发送完整 magnet 链接。", [[{"text": "返回主页", "callback_data": "home:home"}]])
+        return send(chat_id, "请发送完整 magnet 链接，或直接上传 .torrent 种子文件。", [[{"text": "返回主页", "callback_data": "home:home"}]])
     if data == "home:tasks":
         return show_tasks(chat_id)
     if data == "home:server":
@@ -481,13 +577,16 @@ def handle(update):
     if not message or message.get("from", {}).get("id") != OWNER:
         return
     chat_id = message["chat"]["id"]
+    document = message.get("document")
+    if document:
+        return add_torrent_file(chat_id, OWNER, document, message["message_id"])
     text = message.get("text", "").strip()
     if text.startswith("magnet:?xt=urn:btih:"):
         return add_magnet(chat_id, OWNER, text, message["message_id"])
     if text in {"/start", "/menu"}:
         return home(chat_id, message["from"].get("first_name", ""))
     if text == "/help":
-        return send(chat_id, "发送 magnet 链接后选择分类。\n下载完成后由 MoviePilot 自动整理并上传。\n\n/tasks 可查看任务。")
+        return send(chat_id, "发送 magnet 链接或上传 .torrent 文件后选择分类。\n下载完成后由 MoviePilot 自动整理、命名并上传。\n\n/tasks 可查看任务。")
     if legacy_command(chat_id, text):
         return
     if any(word in text for word in ("空间", "硬盘", "云盘", "容量", "服务器状态")):
