@@ -58,6 +58,7 @@ ARIA2_FILE = DATA_DIR / "aria2.json"
 ARIA2_TRACKED = json.loads(ARIA2_FILE.read_text()) if ARIA2_FILE.exists() else {}
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
+QUARK_URL_RE = re.compile(r"https?://pan\.quark\.cn/s/[A-Za-z0-9]+(?:\?[^\s]*)?", re.IGNORECASE)
 
 
 def request(url, data=None, headers=None):
@@ -157,6 +158,30 @@ def aria2_percent(item):
 def is_quark_share(text):
     parsed = urllib.parse.urlparse(text)
     return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "pan.quark.cn" and parsed.path.startswith("/s/")
+
+
+def extract_quark_share(text):
+    """Find a Quark link even when it is embedded in a forwarded post."""
+    match = QUARK_URL_RE.search(text)
+    return match.group(0).rstrip(".,，。;；)") if match else None
+
+
+def extract_post_title(text):
+    """Read the media name from a post line such as '🎬 悬案 (2026) 4K ...'."""
+    match = re.search(r"(?:^|\n)\s*🎬\s*([^\n]+)", text)
+    if not match:
+        return None
+    heading = match.group(1).strip()
+    # Release notes follow the first bracket. Prefer the normal title + year
+    # before it, e.g. '悬案 (2026)' from a channel post.
+    heading = re.split(r"\s*\[", heading, maxsplit=1)[0].strip()
+    year = re.match(r"^(.*?(?:\(\d{4}\)|（\d{4}）))", heading)
+    title = year.group(1) if year else heading
+    title = re.sub(r"\s+(?:4K|2160[Pp]|1080[Pp]|720[Pp])\b.*$", "", title).strip()
+    try:
+        return media_folder_name(title)
+    except RuntimeError:
+        return None
 
 
 def qas_open(path, payload=None, timeout=1800):
@@ -328,14 +353,17 @@ def run_quark_queue():
     threading.Thread(target=worker, daemon=True).start()
 
 
-def add_quark_share(chat_id, share_url, source_message_id):
+def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": source_message_id})
     except Exception as exc:
         print("delete-quark-source error:", exc, flush=True)
     def worker():
         try:
-            base_url, folders, title_hint = qas_download_choices(share_url)
+            base_url, folders, folder_title_hint = qas_download_choices(share_url)
+            # The post title is explicit user-provided metadata and always wins
+            # over a folder name, which can be malformed or release-only text.
+            title_hint = post_title or folder_title_hint
             if len(folders) <= 1:
                 if not folders:
                     return enqueue_quark_task(chat_id, base_url, title_hint)
@@ -960,7 +988,7 @@ def handle_callback(callback):
         except (ValueError, IndexError):
             return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
         selected_url = selected_share_url(pending["url"], folder)
-        title = folder_media_title(folder["name"]) or pending.get("title_hint")
+        title = pending.get("title_hint") or folder_media_title(folder["name"])
         if title:
             return enqueue_quark_task(chat_id, selected_url, title)
         return request_quark_title(chat_id, selected_url, folder["name"])
@@ -1035,8 +1063,9 @@ def handle(update):
             save_quark_title_pending()
             enqueue_quark_task(chat_id, title_pending["url"], title)
             return send_temporary(chat_id, f"已设置媒体：{title}\n开始夸克转存队列。", lifetime_seconds=12)
-    if is_quark_share(text):
-        return add_quark_share(chat_id, text, message["message_id"])
+    quark_share = extract_quark_share(text)
+    if quark_share:
+        return add_quark_share(chat_id, quark_share, message["message_id"], extract_post_title(text))
     if text.startswith("magnet:?xt=urn:btih:"):
         return add_magnet(chat_id, OWNER, text, message["message_id"])
     if text in {"/start", "/menu"}:
