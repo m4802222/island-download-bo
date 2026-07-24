@@ -527,15 +527,13 @@ def show_tasks(chat_id):
     for position, item in enumerate(QUARK_QUEUE, start=1):
         lines.append(f"☁️ 夸克队列 {position}\n{item.get('name', '夸克任务')}")
     for item in aria_items[:6]:
-        lines.append(f"⚡ {aria2_name(item)[:34]}\n{aria2_percent(item):.0f}% · {item.get('status', '未知')}")
-        buttons.append([{"text": "详情", "callback_data": f"aria:{item['gid'][:8]}"}, {"text": "刷新", "callback_data": "home:tasks"}])
+        buttons.append([{"text": f"⚡ {aria2_name(item)[:28]} · {aria2_percent(item):.0f}%", "callback_data": f"aria:{item['gid'][:8]}"}])
     for item in active_qbit[:6]:
         short_hash = item["hash"][:8]
-        lines.append(f"⬇️ {item.get('name', '')[:34]}\n{item.get('progress', 0) * 100:.0f}% · {item.get('state', '未知')}")
-        buttons.append([{"text": "详情", "callback_data": f"task:{short_hash}"}, {"text": "刷新", "callback_data": "home:tasks"}])
+        buttons.append([{"text": f"⬇️ {item.get('name', '')[:28]} · {item.get('progress', 0) * 100:.0f}%", "callback_data": f"task:{short_hash}"}])
     if completed_count:
         buttons.append([{"text": f"已完成 {completed_count} 项", "callback_data": "home:completed"}])
-    buttons.append([{"text": "← 主菜单", "callback_data": "home:home"}])
+    buttons.append([{"text": "刷新", "callback_data": "home:tasks"}, {"text": "← 主菜单", "callback_data": "home:home"}])
     send(chat_id, "📋 下载任务\n\n" + "\n\n".join(lines), buttons)
 
 
@@ -596,7 +594,66 @@ def show_aria_task(chat_id, short_gid):
         f"大小：{done:.2f} / {total:.2f} GB\n"
         f"速度：{speed:.2f} MiB/s"
     )
-    send(chat_id, text, [[{"text": "← 下载任务", "callback_data": "home:tasks"}]])
+    status = item.get("status")
+    if status == "active":
+        control = {"text": "暂停", "callback_data": f"ariaaction:pause:{item['gid'][:8]}"}
+    elif status in {"waiting", "paused"}:
+        control = {"text": "继续", "callback_data": f"ariaaction:resume:{item['gid'][:8]}"}
+    else:
+        control = None
+    keyboard = []
+    if control:
+        keyboard.append([control, {"text": "删除", "callback_data": f"ariadeleteask:{item['gid'][:8]}"}])
+    keyboard.append([{"text": "← 下载任务", "callback_data": "home:tasks"}])
+    send(chat_id, text, keyboard)
+
+
+def find_aria_task(short_gid):
+    matches = [item for item in aria2_recent() if item.get("gid", "").startswith(short_gid)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def delete_aria_files(item):
+    """Remove the task's local Aria2 files, including files moved to complete."""
+    names = set()
+    for entry in item.get("files") or []:
+        source = entry.get("path") or ""
+        if not source.startswith("/downloads/"):
+            continue
+        local = Path("/aria2-downloads") / source.removeprefix("/downloads/")
+        names.add(local.name)
+        local.unlink(missing_ok=True)
+        Path(str(local) + ".aria2").unlink(missing_ok=True)
+
+    # The completion hook moves successful downloads from incoming to complete.
+    # Delete only files with the exact task filenames from that bot-owned folder.
+    complete_dir = Path("/aria2-downloads/complete")
+    if complete_dir.exists():
+        for name in names:
+            for local in complete_dir.rglob(name):
+                if local.is_file():
+                    local.unlink(missing_ok=True)
+                    Path(str(local) + ".aria2").unlink(missing_ok=True)
+
+
+def aria_action(chat_id, action, short_gid):
+    item = find_aria_task(short_gid)
+    if not item:
+        return send(chat_id, "Aria2 任务不存在或已被清理。", home_keyboard())
+    method = "aria2.forcePause" if action == "pause" else "aria2.unpause"
+    aria2_rpc(method, [item["gid"]])
+    return show_aria_task(chat_id, short_gid)
+
+
+def aria_delete(chat_id, short_gid):
+    item = find_aria_task(short_gid)
+    if not item:
+        return send(chat_id, "Aria2 任务不存在或已被清理。", home_keyboard())
+    aria2_rpc("aria2.forceRemove", [item["gid"]])
+    delete_aria_files(item)
+    ARIA2_TRACKED.pop(item["gid"], None)
+    save_aria2_tracked()
+    return send(chat_id, "已删除 Aria2 任务及 VPS 上该任务的文件。", home_keyboard())
 
 
 def server_status(chat_id):
@@ -760,6 +817,14 @@ def handle_callback(callback):
         return show_task(chat_id, data.split(":", 1)[1])
     if data.startswith("aria:"):
         return show_aria_task(chat_id, data.split(":", 1)[1])
+    if data.startswith("ariaaction:"):
+        _, action, short_gid = data.split(":", 2)
+        return aria_action(chat_id, action, short_gid)
+    if data.startswith("ariadeleteask:"):
+        short_gid = data.split(":", 1)[1]
+        return send(chat_id, "确定删除 Aria2 任务及 VPS 未完成文件吗？", [[{"text": "确认删除", "callback_data": f"ariadeleteyes:{short_gid}"}, {"text": "取消", "callback_data": f"aria:{short_gid}"}]])
+    if data.startswith("ariadeleteyes:"):
+        return aria_delete(chat_id, data.split(":", 1)[1])
     if data.startswith("action:"):
         _, action, short_hash = data.split(":", 2)
         item = find_task(short_hash)
