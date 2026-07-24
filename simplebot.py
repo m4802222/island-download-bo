@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import time
+import re
 import urllib.error
 import http.cookiejar
 import urllib.parse
@@ -49,6 +50,8 @@ QUARK_QUEUE_FILE = DATA_DIR / "quark_queue.json"
 QUARK_QUEUE = list(json.loads(QUARK_QUEUE_FILE.read_text())) if QUARK_QUEUE_FILE.exists() else []
 QUARK_PENDING_FILE = DATA_DIR / "quark_pending.json"
 QUARK_PENDING = json.loads(QUARK_PENDING_FILE.read_text()) if QUARK_PENDING_FILE.exists() else {}
+QUARK_TITLE_PENDING_FILE = DATA_DIR / "quark_title_pending.json"
+QUARK_TITLE_PENDING = json.loads(QUARK_TITLE_PENDING_FILE.read_text()) if QUARK_TITLE_PENDING_FILE.exists() else {}
 QUARK_ACTIVE = False
 QUARK_LOCK = threading.Lock()
 ARIA2_FILE = DATA_DIR / "aria2.json"
@@ -102,6 +105,10 @@ def save_quark_queue():
 
 def save_quark_pending():
     QUARK_PENDING_FILE.write_text(json.dumps(QUARK_PENDING, ensure_ascii=False))
+
+
+def save_quark_title_pending():
+    QUARK_TITLE_PENDING_FILE.write_text(json.dumps(QUARK_TITLE_PENDING, ensure_ascii=False))
 
 
 def save_aria2_tracked():
@@ -165,7 +172,21 @@ def qas_open(path, payload=None, timeout=1800):
     return opener.open(urllib.request.Request(f"{QAS_URL}{path}", body, headers), timeout=timeout)
 
 
-def qas_task(share_url, task_name):
+def media_folder_name(title):
+    """Make a safe, human-readable parent folder for MoviePilot recognition."""
+    name = re.sub(r'[\\/:*?"<>|]+', " ", title).strip()
+    name = re.sub(r"\s+", " ", name)
+    if not name:
+        raise RuntimeError("剧名不能为空")
+    return name[:96]
+
+
+def qas_task(share_url, task_name, media_title=None):
+    # QAS's Aria2 plugin flattens the source tree when save_path is set. Put a
+    # title in the destination path so MoviePilot sees e.g. "剧名 (年份)/S01E02".
+    aria_save_path = "incoming"
+    if media_title:
+        aria_save_path = f"incoming/{media_folder_name(media_title)}"
     return {
         "taskname": task_name,
         "shareurl": share_url,
@@ -178,9 +199,7 @@ def qas_task(share_url, task_name):
             "aria2": {
                 "auto_download": True,
                 "download_subdir": True,
-                # This directory is created before the bot starts. Aria2 does
-                # not create nested QAS source paths on this image.
-                "save_path": "incoming",
+                "save_path": aria_save_path,
                 "pause": False,
             }
         },
@@ -209,8 +228,12 @@ def selected_share_url(share_url, folder):
     return f"{base}#/list/share/{folder['fid']}-{name}"
 
 
-def enqueue_quark_task(chat_id, share_url):
-    task = {"url": share_url, "name": f"夸克任务-{time.strftime('%m%d-%H%M%S')}"}
+def enqueue_quark_task(chat_id, share_url, media_title=None):
+    task = {
+        "url": share_url,
+        "name": f"夸克任务-{time.strftime('%m%d-%H%M%S')}",
+        "media_title": media_title,
+    }
     with QUARK_LOCK:
         QUARK_QUEUE.append(task)
         save_quark_queue()
@@ -233,7 +256,7 @@ def run_quark_queue():
         global QUARK_ACTIVE
         try:
             before = {item.get("gid") for item in aria2_recent()}
-            response = qas_open("/run_script_now", {"tasklist": [qas_task(task["url"], task["name"])]})
+            response = qas_open("/run_script_now", {"tasklist": [qas_task(task["url"], task["name"], task.get("media_title"))]})
             output = response.read().decode(errors="replace")
             if "❌" in output or "任务执行失败" in output:
                 raise RuntimeError("QAS 未能完成转存，请检查夸克链接或 QAS 日志")
@@ -241,7 +264,8 @@ def run_quark_queue():
             for item in added:
                 ARIA2_TRACKED[item["gid"]] = {"name": aria2_name(item), "notified": False}
             save_aria2_tracked()
-            send_temporary(OWNER, f"☁️ 已转存并交给 Aria2 下载\n\n{task['name']}\n\nMoviePilot 会在完成后自动整理并上传 Google Drive。", lifetime_seconds=12)
+            title_line = f"\n媒体：{task['media_title']}" if task.get("media_title") else ""
+            send_temporary(OWNER, f"☁️ 已转存并交给 Aria2 下载\n\n{task['name']}{title_line}\n\nMoviePilot 会在完成后自动整理并上传 Google Drive。", lifetime_seconds=12)
         except Exception as exc:
             print("quark-queue error:", exc, flush=True)
             send(OWNER, f"⚠️ 夸克任务失败\n\n{task['name']}\n{str(exc)[:160]}")
@@ -872,8 +896,16 @@ def handle_callback(callback):
             folder = pending["folders"][int(index_text)]
         except (ValueError, IndexError):
             return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
-        enqueue_quark_task(chat_id, selected_share_url(pending["url"], folder))
-        return send_temporary(chat_id, f"已选择：{folder['name']}", lifetime_seconds=12)
+        # The selected folders can be generic names such as "Season 1 (HQ)".
+        # Asking once for the actual title is the only non-guessing way to give
+        # MoviePilot enough metadata when every file is only named S01E02, etc.
+        QUARK_TITLE_PENDING[str(chat_id)] = {
+            "url": selected_share_url(pending["url"], folder),
+            "folder": folder["name"],
+            "created_at": time.time(),
+        }
+        save_quark_title_pending()
+        return send(chat_id, f"已选择：{folder['name']}\n\n请输入剧名和年份，例如：\n鱿鱼游戏 (2021)\n\n输入 /cancel 可取消。")
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
     if data.startswith("task:"):
@@ -930,6 +962,21 @@ def handle(update):
     if document:
         return add_torrent_file(chat_id, OWNER, document, message["message_id"])
     text = message.get("text", "").strip()
+    title_pending = QUARK_TITLE_PENDING.get(str(chat_id))
+    if title_pending:
+        if text == "/cancel":
+            QUARK_TITLE_PENDING.pop(str(chat_id), None)
+            save_quark_title_pending()
+            return send(chat_id, "已取消这次夸克下载。", home_keyboard())
+        if text and not text.startswith("/") and not is_quark_share(text) and not text.startswith("magnet:"):
+            try:
+                title = media_folder_name(text)
+            except RuntimeError as exc:
+                return send(chat_id, str(exc))
+            QUARK_TITLE_PENDING.pop(str(chat_id), None)
+            save_quark_title_pending()
+            enqueue_quark_task(chat_id, title_pending["url"], title)
+            return send_temporary(chat_id, f"已设置媒体：{title}\n开始夸克转存队列。", lifetime_seconds=12)
     if is_quark_share(text):
         return add_quark_share(chat_id, text, message["message_id"])
     if text.startswith("magnet:?xt=urn:btih:"):
