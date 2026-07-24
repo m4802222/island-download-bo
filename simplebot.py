@@ -30,6 +30,7 @@ QUEUE_READY = QUEUE_FILE.exists()
 BLOCKED_FILE = DATA_DIR / "blocked.json"
 BLOCKED = set(json.loads(BLOCKED_FILE.read_text())) if BLOCKED_FILE.exists() else set()
 RESERVE_GIB = int(os.environ.get("MIN_FREE_GIB", "10"))
+MAX_ACTIVE_DOWNLOADS = max(1, int(os.environ.get("MAX_ACTIVE_DOWNLOADS", "2")))
 GIB = 1024 * 1024 * 1024
 EXPIRY_FILE = DATA_DIR / "expiry.json"
 EXPIRING = list(json.loads(EXPIRY_FILE.read_text())) if EXPIRY_FILE.exists() else []
@@ -241,7 +242,7 @@ def category_keyboard():
 
 def home(chat_id, first_name=""):
     greeting = f"你好，{first_name}。" if first_name else "你好。"
-    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接或 .torrent 文件。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
+    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接或 .torrent 文件即可。\n系统会智能分类，最多同时下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
 
 
 def task_list():
@@ -257,16 +258,18 @@ def save_blocked():
 
 
 def file_size(item):
+    if "amount_left" in item:
+        return int(item.get("amount_left") or 0)
     return int(item.get("total_size") or item.get("size") or 0)
 
 
-def has_enough_space(item):
+def has_enough_space(item, free=None):
     """Return whether the next download fits, with a fixed safety reserve."""
     size = file_size(item)
     if size <= 0:
         # A magnet can need a short metadata phase before qBittorrent knows size.
-        return True, size, shutil.disk_usage("/downloads").free
-    free = shutil.disk_usage("/downloads").free
+        return True, size, free if free is not None else shutil.disk_usage("/downloads").free
+    free = free if free is not None else shutil.disk_usage("/downloads").free
     return size <= max(0, free - RESERVE_GIB * GIB), size, free
 
 
@@ -296,7 +299,7 @@ def google_drive_capacity():
 
 
 def run_queue():
-    """Keep exactly one IslandDownloadBot task downloading at a time."""
+    """Keep up to MAX_ACTIVE_DOWNLOADS bot tasks downloading in queue order."""
     global QUEUE_READY
     tasks = task_list()
     task_by_hash = {item["hash"]: item for item in tasks}
@@ -316,29 +319,33 @@ def run_queue():
     if not QUEUE:
         return
 
-    current = QUEUE[0]
+    active_hashes = QUEUE[:MAX_ACTIVE_DOWNLOADS]
     # Every later item stays paused, even after a container restart.
-    for task_hash in QUEUE[1:]:
+    for task_hash in QUEUE[MAX_ACTIVE_DOWNLOADS:]:
         item = task_by_hash.get(task_hash)
         if item and item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
             qbit("/api/v2/torrents/pause", {"hashes": task_hash})
-    item = task_by_hash.get(current)
-    if not item:
-        return
-    fits, size, free = has_enough_space(item)
-    if not fits:
-        if item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-            qbit("/api/v2/torrents/pause", {"hashes": current})
-        if current not in BLOCKED:
-            BLOCKED.add(current)
+    free = shutil.disk_usage("/downloads").free
+    available = max(0, free - RESERVE_GIB * GIB)
+    for task_hash in active_hashes:
+        item = task_by_hash.get(task_hash)
+        if not item:
+            continue
+        fits, size, _ = has_enough_space(item, available + RESERVE_GIB * GIB)
+        if not fits:
+            if item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+                qbit("/api/v2/torrents/pause", {"hashes": task_hash})
+            if task_hash not in BLOCKED:
+                BLOCKED.add(task_hash)
+                save_blocked()
+                send(OWNER, f"⚠️ 队列暂停：空间不足\n\n{item.get('name', '')[:55]}\n剩余需下载：{size / GIB:.1f} GB\n当前可用：{free / GIB:.1f} GB\n安全预留：{RESERVE_GIB} GB\n\n等待 MoviePilot 上传并清理文件后，将自动继续。")
+            continue
+        available = max(0, available - size)
+        if task_hash in BLOCKED:
+            BLOCKED.remove(task_hash)
             save_blocked()
-            send(OWNER, f"⚠️ 队列暂停：空间不足\n\n{item.get('name', '')[:55]}\n资源大小：{size / GIB:.1f} GB\n当前可用：{free / GIB:.1f} GB\n安全预留：{RESERVE_GIB} GB\n\n等待 MoviePilot 上传并清理文件后，将自动继续。")
-        return
-    if current in BLOCKED:
-        BLOCKED.remove(current)
-        save_blocked()
-    if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-        qbit("/api/v2/torrents/resume", {"hashes": current})
+        if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+            qbit("/api/v2/torrents/resume", {"hashes": task_hash})
 
 
 def show_tasks(chat_id):
@@ -351,7 +358,7 @@ def show_tasks(chat_id):
         short_hash = item["hash"][:8]
         progress = item.get("progress", 0) * 100
         state = item.get("state", "未知")
-        category = item.get("category") or "未分类"
+        category = item.get("category") or "智能分类（MoviePilot）"
         position = QUEUE.index(item["hash"]) + 1 if item["hash"] in QUEUE else "—"
         lines.append(f"队列 {position} · {progress:.0f}% · {state}\n{item.get('name', '')[:42]}\n{category}")
         buttons.append([{"text": f"查看 {short_hash}", "callback_data": f"task:{short_hash}"}])
@@ -373,7 +380,7 @@ def show_task(chat_id, short_hash):
     size = item.get("size", 0) / 1024 / 1024 / 1024
     text = (
         f"📥 {item.get('name', '')}\n\n"
-        f"分类：{item.get('category') or '未分类'}\n"
+        f"分类：{item.get('category') or '智能分类（MoviePilot）'}\n"
         f"进度：{progress:.1f}%\n状态：{state}\n大小：{size:.2f} GB\n"
         f"哈希：{item['hash'][:8]}"
     )
@@ -421,7 +428,7 @@ def add_magnet(chat_id, user_id, magnet, source_message_id):
     if old and old.get("torrent_path"):
         Path(old["torrent_path"]).unlink(missing_ok=True)
     PENDING[user_id] = {"magnet": magnet, "source_message_id": source_message_id}
-    send(chat_id, "选择影视分类：", category_keyboard())
+    return add_to_qbit(chat_id, user_id, "__auto__")
 
 
 def download_telegram_file(file_id):
@@ -455,7 +462,7 @@ def add_torrent_file(chat_id, user_id, document, source_message_id):
     stored = INCOMING_DIR / f"{user_id}-{uuid.uuid4().hex}.torrent"
     stored.write_bytes(content)
     PENDING[user_id] = {"torrent_path": str(stored), "filename": filename, "source_message_id": source_message_id}
-    send(chat_id, f"已收到种子文件：{filename[:48]}\n\n选择影视分类：", category_keyboard())
+    return add_to_qbit(chat_id, user_id, "__auto__")
 
 
 def add_to_qbit(chat_id, user_id, category):
@@ -530,7 +537,7 @@ def handle_callback(callback):
     if data == "home:home":
         return home(chat_id, callback["from"].get("first_name", ""))
     if data == "home:add":
-        return send(chat_id, "请发送完整 magnet 链接，或直接上传 .torrent 种子文件。", [[{"text": "返回主页", "callback_data": "home:home"}]])
+        return send(chat_id, "请发送完整 magnet 链接，或直接上传 .torrent 种子文件。\n系统会自动交给 MoviePilot 智能分类。", [[{"text": "返回主页", "callback_data": "home:home"}]])
     if data == "home:tasks":
         return show_tasks(chat_id)
     if data == "home:server":
@@ -586,7 +593,7 @@ def handle(update):
     if text in {"/start", "/menu"}:
         return home(chat_id, message["from"].get("first_name", ""))
     if text == "/help":
-        return send(chat_id, "发送 magnet 链接或上传 .torrent 文件后选择分类。\n下载完成后由 MoviePilot 自动整理、命名并上传。\n\n/tasks 可查看任务。")
+        return send(chat_id, f"发送 magnet 链接或上传 .torrent 文件即可。\n系统会智能分类，同时最多下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n下载完成后由 MoviePilot 自动整理、命名并上传。\n\n/tasks 可查看任务。")
     if legacy_command(chat_id, text):
         return
     if any(word in text for word in ("空间", "硬盘", "云盘", "容量", "服务器状态")):
@@ -603,7 +610,7 @@ def watch_completed():
             continue
         SEEN.add(item["hash"])
         DONE_FILE.write_text(json.dumps(list(SEEN)))
-        send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '未分类'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
+        send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '智能分类（MoviePilot）'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
     run_queue()
 
 
