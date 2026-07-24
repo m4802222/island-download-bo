@@ -163,14 +163,18 @@ def qas_task(share_url, task_name):
     return {
         "taskname": task_name,
         "shareurl": share_url,
-        "savepath": QUARK_SAVE_PATH,
+        # Each request gets its own Quark temporary folder. That prevents a
+        # repeat share from being mistaken for an already-processed task.
+        "savepath": f"{QUARK_SAVE_PATH}/{task_name}",
         "pattern": "",
         "replace": "",
         "addition": {
             "aria2": {
                 "auto_download": True,
                 "download_subdir": True,
-                "save_path": "",
+                # This directory is created before the bot starts. Aria2 does
+                # not create nested QAS source paths on this image.
+                "save_path": "incoming",
                 "pause": False,
             }
         },
