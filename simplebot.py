@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -253,7 +254,7 @@ def request_quark_title(chat_id, share_url, folder_name):
     return send(chat_id, f"已选择：{folder_name}\n\n这个目录没有剧名。请输入剧名和年份，例如：\n鱿鱼游戏 (2021)\n\n输入 /cancel 可取消。")
 
 
-def qas_task(share_url, task_name, media_title=None):
+def qas_task(share_url, task_name, media_title=None, pattern=""):
     # QAS's Aria2 plugin flattens the source tree when save_path is set. Put a
     # title in the destination path so MoviePilot sees e.g. "剧名 (年份)/S01E02".
     aria_save_path = "incoming"
@@ -265,7 +266,7 @@ def qas_task(share_url, task_name, media_title=None):
         # Each request gets its own Quark temporary folder. That prevents a
         # repeat share from being mistaken for an already-processed task.
         "savepath": f"{QUARK_SAVE_PATH}/{task_name}",
-        "pattern": "",
+        "pattern": pattern,
         "replace": "",
         "addition": {
             "aria2": {
@@ -295,6 +296,86 @@ def qas_share_folders(share_url, stoken=None):
         if item.get("dir") and item.get("fid") and item.get("file_name")
     ]
     return folders, payload.get("data", {}).get("stoken")
+
+
+VIDEO_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov")
+
+
+def episode_key(text):
+    """Normalize S01E02-like labels so release names can be compared exactly."""
+    match = re.search(r"(?i)\bS(\d{1,2})E(\d{1,3})\b", text)
+    if not match:
+        return None
+    return f"S{int(match.group(1)):02d}E{int(match.group(2)):03d}"
+
+
+def episode_keys(text):
+    return {
+        f"S{int(season):02d}E{int(episode):03d}"
+        for season, episode in re.findall(r"(?i)\bS(\d{1,2})E(\d{1,3})\b", text)
+    }
+
+
+def qas_share_video_files(share_url):
+    """Return direct video file names in the chosen Quark directory."""
+    response = qas_open("/get_share_detail", {"shareurl": share_url})
+    payload = json.loads(response.read().decode(errors="replace"))
+    if not payload.get("success"):
+        error = payload.get("data", {}).get("error") or payload.get("message") or "夸克目录读取失败"
+        raise RuntimeError(error)
+    return [
+        item["file_name"]
+        for item in payload.get("data", {}).get("list", [])
+        if not item.get("dir")
+        and item.get("file_name", "").lower().endswith(VIDEO_EXTENSIONS)
+    ]
+
+
+def moviepilot_existing(media_title):
+    """Read successful MoviePilot transfers, which are the upload-complete source of truth."""
+    database = Path("/moviepilot-config/user.db")
+    if not database.is_file():
+        raise RuntimeError("MoviePilot 整理历史不可读取，已停止提交下载以防重复")
+    title = re.sub(r"\s*[（(]\d{4}[)）]\s*$", "", media_title).strip()
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        rows = connection.execute(
+            "SELECT title, episodes, dest, files FROM transferhistory "
+            "WHERE status = 1 AND (title LIKE ? OR dest LIKE ?)",
+            (f"%{title}%", f"%{title}%"),
+        ).fetchall()
+        connection.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"MoviePilot 整理历史读取失败，未提交下载：{exc}")
+    episodes = set()
+    for row in rows:
+        for value in row:
+            if value:
+                episodes.update(episode_keys(str(value)))
+    return episodes, bool(rows)
+
+
+def quark_missing_plan(share_url, media_title):
+    """Build a QAS include regex for only the episodes absent from MoviePilot."""
+    files = qas_share_video_files(share_url)
+    if not files:
+        return "", 0, 0
+    existing_episodes, has_history = moviepilot_existing(media_title)
+    episode_files = [(name, episode_key(name)) for name in files]
+    if any(key for _, key in episode_files):
+        missing = [name for name, key in episode_files if not key or key not in existing_episodes]
+    elif has_history:
+        # Movies do not have episode IDs. A successful record for the same
+        # title means the user already has that movie in this media library.
+        missing = []
+    else:
+        missing = files
+    skipped = len(files) - len(missing)
+    if not missing:
+        return None, len(files), skipped
+    if skipped:
+        return r"^(?:" + "|".join(re.escape(name) for name in missing) + r")$", len(files), skipped
+    return "", len(files), 0
 
 
 def qas_download_choices(share_url, max_depth=5):
@@ -330,16 +411,28 @@ def selected_share_url(share_url, folder):
 
 
 def enqueue_quark_task(chat_id, share_url, media_title=None):
+    pattern = ""
+    total = skipped = 0
+    if media_title:
+        pattern, total, skipped = quark_missing_plan(share_url, media_title)
+        if pattern is None:
+            return send_temporary(
+                chat_id,
+                f"✅ 已跳过下载\n\n{media_title} 共 {total} 个视频文件，均已由 MoviePilot 整理并上传。",
+                lifetime_seconds=15,
+            )
     task = {
         "url": share_url,
         "name": f"夸克任务-{time.strftime('%m%d-%H%M%S')}",
         "media_title": media_title,
+        "pattern": pattern,
     }
     with QUARK_LOCK:
         QUARK_QUEUE.append(task)
         save_quark_queue()
         position = len(QUARK_QUEUE) + (1 if QUARK_ACTIVE else 0)
-    send_temporary(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}\n夸克转存 → Aria2 → MoviePilot → Google Drive", lifetime_seconds=12)
+    skipped_line = f"\n已跳过已入库：{skipped} 个" if skipped else ""
+    send_temporary(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}{skipped_line}\n夸克转存 → Aria2 → MoviePilot → Google Drive", lifetime_seconds=12)
     run_quark_queue()
 
 
@@ -357,7 +450,7 @@ def run_quark_queue():
         global QUARK_ACTIVE
         try:
             before = {item.get("gid") for item in aria2_recent()}
-            response = qas_open("/run_script_now", {"tasklist": [qas_task(task["url"], task["name"], task.get("media_title"))]})
+            response = qas_open("/run_script_now", {"tasklist": [qas_task(task["url"], task["name"], task.get("media_title"), task.get("pattern", ""))]})
             output = response.read().decode(errors="replace")
             if "❌" in output or "任务执行失败" in output:
                 raise RuntimeError("QAS 未能完成转存，请检查夸克链接或 QAS 日志")
