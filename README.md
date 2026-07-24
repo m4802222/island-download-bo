@@ -13,6 +13,7 @@
 - 自动兼容 qBittorrent 5 的 HTTP 204 登录响应；会话过期自动重连，短暂网络失败自动重试
 - 下载完成提醒；后续由 MoviePilot 监控下载器，自动识别、命名、上传 Google Drive 并清理源文件
 - 下载完成提示会在 5 分钟后自动清理，保持聊天简洁
+- 支持发送 `pan.quark.cn` 分享链接：QAS 转存后将文件直链交给 Aria2，完成后由 MoviePilot 入库 Google Drive
 - 普通中文消息接入本地 Ollama AI 助手；下载与删除仍须使用机器人操作确认
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
 
@@ -32,5 +33,7 @@ docker run -d --name island-download-bot --network media-net --restart unless-st
 ```
 
 `.env` 不应上传至 GitHub。
+
+如需夸克分享链接功能，额外填写 `QAS_URL`、`QAS_USERNAME`、`QAS_PASSWORD`。QAS 与机器人须位于同一个 Docker 网络。
 
 `MIN_FREE_GIB` 可调整下载目录的安全预留空间，默认值为 `10`。

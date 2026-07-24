@@ -2,8 +2,10 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
+import http.cookiejar
 import urllib.parse
 import urllib.request
 import uuid
@@ -16,6 +18,10 @@ QBIT_USER = os.environ["QBIT_USERNAME"]
 QBIT_PASSWORD = os.environ["QBIT_PASSWORD"]
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
+QAS_URL = os.environ.get("QAS_URL", "http://quark-auto-save:5005").rstrip("/")
+QAS_USER = os.environ.get("QAS_USERNAME", "")
+QAS_PASSWORD = os.environ.get("QAS_PASSWORD", "")
+QUARK_SAVE_PATH = os.environ.get("QUARK_SAVE_PATH", "/IslandDownloadBot")
 COOKIE = ""
 OFFSET = 0
 PENDING = {}
@@ -37,6 +43,10 @@ EXPIRING = list(json.loads(EXPIRY_FILE.read_text())) if EXPIRY_FILE.exists() els
 INCOMING_DIR = DATA_DIR / "incoming"
 INCOMING_DIR.mkdir(exist_ok=True)
 MAX_TORRENT_BYTES = 20 * 1024 * 1024
+QUARK_QUEUE_FILE = DATA_DIR / "quark_queue.json"
+QUARK_QUEUE = list(json.loads(QUARK_QUEUE_FILE.read_text())) if QUARK_QUEUE_FILE.exists() else []
+QUARK_ACTIVE = False
+QUARK_LOCK = threading.Lock()
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 
@@ -78,6 +88,89 @@ def json_request(url, payload, timeout=100):
         return exc.code, exc.read().decode(errors="replace"), exc.headers
     except Exception as exc:
         return 599, str(exc), {}
+
+
+def save_quark_queue():
+    QUARK_QUEUE_FILE.write_text(json.dumps(QUARK_QUEUE, ensure_ascii=False))
+
+
+def is_quark_share(text):
+    parsed = urllib.parse.urlparse(text)
+    return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "pan.quark.cn" and parsed.path.startswith("/s/")
+
+
+def qas_open(path, payload=None, timeout=1800):
+    """Log in to QAS for one request and return its response."""
+    if not QAS_USER or not QAS_PASSWORD:
+        raise RuntimeError("夸克模块尚未配置 QAS 账号")
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    login_body = urllib.parse.urlencode({"username": QAS_USER, "password": QAS_PASSWORD}).encode()
+    opener.open(urllib.request.Request(f"{QAS_URL}/login", login_body), timeout=30).read()
+    headers = {"Content-Type": "application/json"}
+    body = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
+    return opener.open(urllib.request.Request(f"{QAS_URL}{path}", body, headers), timeout=timeout)
+
+
+def qas_task(share_url, task_name):
+    return {
+        "taskname": task_name,
+        "shareurl": share_url,
+        "savepath": QUARK_SAVE_PATH,
+        "pattern": "",
+        "replace": "",
+        "addition": {
+            "aria2": {
+                "auto_download": True,
+                "download_subdir": True,
+                "save_path": "",
+                "pause": False,
+            }
+        },
+    }
+
+
+def run_quark_queue():
+    """Run one QAS transfer at a time; QAS then dispatches files to Aria2."""
+    global QUARK_ACTIVE
+    with QUARK_LOCK:
+        if QUARK_ACTIVE or not QUARK_QUEUE:
+            return
+        task = QUARK_QUEUE.pop(0)
+        save_quark_queue()
+        QUARK_ACTIVE = True
+
+    def worker():
+        global QUARK_ACTIVE
+        try:
+            response = qas_open("/run_script_now", {"tasklist": [qas_task(task["url"], task["name"])]})
+            output = response.read().decode(errors="replace")
+            if "❌" in output or "任务执行失败" in output:
+                raise RuntimeError("QAS 未能完成转存，请检查夸克链接或 QAS 日志")
+            send_temporary(OWNER, f"☁️ 已转存并交给 Aria2 下载\n\n{task['name']}\n\n下载完成后，MoviePilot 会自动整理并上传 Google Drive。")
+        except Exception as exc:
+            print("quark-queue error:", exc, flush=True)
+            send(OWNER, f"⚠️ 夸克任务失败\n\n{task['name']}\n{str(exc)[:160]}")
+        finally:
+            with QUARK_LOCK:
+                QUARK_ACTIVE = False
+            run_quark_queue()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def add_quark_share(chat_id, share_url, source_message_id):
+    task = {"url": share_url, "name": f"夸克任务-{time.strftime('%m%d-%H%M%S')}", "source_message_id": source_message_id}
+    with QUARK_LOCK:
+        QUARK_QUEUE.append(task)
+        save_quark_queue()
+        position = len(QUARK_QUEUE) + (1 if QUARK_ACTIVE else 0)
+    try:
+        telegram("deleteMessage", {"chat_id": chat_id, "message_id": source_message_id})
+    except Exception as exc:
+        print("delete-quark-source error:", exc, flush=True)
+    send(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}\n流程：夸克转存 → Aria2 → MoviePilot → Google Drive")
+    run_quark_queue()
 
 
 def ai_reply(question):
@@ -251,7 +344,7 @@ def category_keyboard():
 
 def home(chat_id, first_name=""):
     greeting = f"你好，{first_name}。" if first_name else "你好。"
-    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet 链接或 .torrent 文件即可。\n系统会智能分类，最多同时下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
+    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet、.torrent 或夸克分享链接。\n系统会智能分类，最多同时下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
 
 
 def task_list():
@@ -359,10 +452,14 @@ def run_queue():
 
 def show_tasks(chat_id):
     tasks = task_list()
-    if not tasks:
+    if not tasks and not QUARK_QUEUE and not QUARK_ACTIVE:
         return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接、.torrent 文件。", home_keyboard())
     lines = []
     buttons = []
+    if QUARK_ACTIVE:
+        lines.append("☁️ 夸克转存 · 正在处理\n完成后会自动交给 Aria2")
+    for position, item in enumerate(QUARK_QUEUE, start=1):
+        lines.append(f"☁️ 夸克队列 {position}\n{item.get('name', '夸克任务')}")
     for item in tasks[:6]:
         short_hash = item["hash"][:8]
         progress = item.get("progress", 0) * 100
@@ -422,7 +519,8 @@ def server_status(chat_id):
         "下载器：qBittorrent 已连接\n"
         f"下载速度：{download:.2f} MiB/s\n"
         f"上传速度：{upload:.2f} MiB/s\n"
-        f"活动任务：{active}\n\n"
+        f"活动任务：{active}\n"
+        f"夸克转存队列：{len(QUARK_QUEUE) + (1 if QUARK_ACTIVE else 0)}\n\n"
         f"VPS 下载盘：总 {disk.total / GIB:.1f} GB · 已用 {used / GIB:.1f} GB · 可用 {disk.free / GIB:.1f} GB\n"
         f"安全预留：{RESERVE_GIB} GB\n\n"
         f"Google Drive：{drive_capacity}\n\n"
@@ -546,7 +644,7 @@ def handle_callback(callback):
     if data == "home:home":
         return home(chat_id, callback["from"].get("first_name", ""))
     if data == "home:add":
-        return send(chat_id, "请发送完整 magnet 链接，或直接上传 .torrent 种子文件。\n系统会自动交给 MoviePilot 智能分类。", [[{"text": "返回主页", "callback_data": "home:home"}]])
+        return send(chat_id, "请发送 magnet、夸克分享链接，或上传 .torrent 种子文件。\n系统会自动交给 MoviePilot 智能分类。", [[{"text": "返回主页", "callback_data": "home:home"}]])
     if data == "home:tasks":
         return show_tasks(chat_id)
     if data == "home:server":
@@ -597,12 +695,14 @@ def handle(update):
     if document:
         return add_torrent_file(chat_id, OWNER, document, message["message_id"])
     text = message.get("text", "").strip()
+    if is_quark_share(text):
+        return add_quark_share(chat_id, text, message["message_id"])
     if text.startswith("magnet:?xt=urn:btih:"):
         return add_magnet(chat_id, OWNER, text, message["message_id"])
     if text in {"/start", "/menu"}:
         return home(chat_id, message["from"].get("first_name", ""))
     if text == "/help":
-        return send(chat_id, f"发送 magnet 链接或上传 .torrent 文件即可。\n系统会智能分类，同时最多下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n下载完成后由 MoviePilot 自动整理、命名并上传。\n\n/tasks 可查看任务。")
+        return send(chat_id, f"发送 magnet、夸克分享链接或上传 .torrent 文件即可。\n系统会智能分类，同时最多下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n下载完成后由 MoviePilot 自动整理、命名并上传。\n\n/tasks 可查看任务。")
     if legacy_command(chat_id, text):
         return
     if any(word in text for word in ("空间", "硬盘", "云盘", "容量", "服务器状态")):
