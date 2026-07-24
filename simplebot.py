@@ -22,6 +22,8 @@ QAS_URL = os.environ.get("QAS_URL", "http://quark-auto-save:5005").rstrip("/")
 QAS_USER = os.environ.get("QAS_USERNAME", "")
 QAS_PASSWORD = os.environ.get("QAS_PASSWORD", "")
 QUARK_SAVE_PATH = os.environ.get("QUARK_SAVE_PATH", "/IslandDownloadBot")
+ARIA2_URL = os.environ.get("ARIA2_URL", "http://aria2:6800/jsonrpc")
+ARIA2_SECRET = os.environ.get("ARIA2_SECRET", "")
 COOKIE = ""
 OFFSET = 0
 PENDING = {}
@@ -47,6 +49,8 @@ QUARK_QUEUE_FILE = DATA_DIR / "quark_queue.json"
 QUARK_QUEUE = list(json.loads(QUARK_QUEUE_FILE.read_text())) if QUARK_QUEUE_FILE.exists() else []
 QUARK_ACTIVE = False
 QUARK_LOCK = threading.Lock()
+ARIA2_FILE = DATA_DIR / "aria2.json"
+ARIA2_TRACKED = json.loads(ARIA2_FILE.read_text()) if ARIA2_FILE.exists() else {}
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 
@@ -92,6 +96,49 @@ def json_request(url, payload, timeout=100):
 
 def save_quark_queue():
     QUARK_QUEUE_FILE.write_text(json.dumps(QUARK_QUEUE, ensure_ascii=False))
+
+
+def save_aria2_tracked():
+    ARIA2_FILE.write_text(json.dumps(ARIA2_TRACKED, ensure_ascii=False))
+
+
+def aria2_rpc(method, params=None):
+    if not ARIA2_SECRET:
+        raise RuntimeError("Aria2 密钥尚未配置")
+    arguments = list(params or [])
+    arguments.insert(0, f"token:{ARIA2_SECRET}")
+    status, body, _ = json_request(
+        ARIA2_URL,
+        {"jsonrpc": "2.0", "id": "island-download-bot", "method": method, "params": arguments},
+        timeout=20,
+    )
+    if status >= 300:
+        raise RuntimeError(f"Aria2 HTTP {status}")
+    payload = json.loads(body)
+    if payload.get("error"):
+        raise RuntimeError(payload["error"].get("message", "Aria2 RPC error"))
+    return payload.get("result")
+
+
+def aria2_recent():
+    keys = ["gid", "status", "totalLength", "completedLength", "downloadSpeed", "errorMessage", "files"]
+    active = aria2_rpc("aria2.tellActive", [keys])
+    waiting = aria2_rpc("aria2.tellWaiting", [0, 30, keys])
+    stopped = aria2_rpc("aria2.tellStopped", [0, 30, keys])
+    return active + waiting + stopped
+
+
+def aria2_name(item):
+    files = item.get("files") or []
+    if files:
+        return Path(files[0].get("path") or "Aria2 文件").name
+    return "Aria2 文件"
+
+
+def aria2_percent(item):
+    total = int(item.get("totalLength") or 0)
+    done = int(item.get("completedLength") or 0)
+    return (done / total * 100) if total else 0
 
 
 def is_quark_share(text):
@@ -143,10 +190,15 @@ def run_quark_queue():
     def worker():
         global QUARK_ACTIVE
         try:
+            before = {item.get("gid") for item in aria2_recent()}
             response = qas_open("/run_script_now", {"tasklist": [qas_task(task["url"], task["name"])]})
             output = response.read().decode(errors="replace")
             if "❌" in output or "任务执行失败" in output:
                 raise RuntimeError("QAS 未能完成转存，请检查夸克链接或 QAS 日志")
+            added = [item for item in aria2_recent() if item.get("gid") not in before]
+            for item in added:
+                ARIA2_TRACKED[item["gid"]] = {"name": aria2_name(item), "notified": False}
+            save_aria2_tracked()
             send_temporary(OWNER, f"☁️ 已转存并交给 Aria2 下载\n\n{task['name']}\n\n下载完成后，MoviePilot 会自动整理并上传 Google Drive。")
         except Exception as exc:
             print("quark-queue error:", exc, flush=True)
@@ -452,7 +504,12 @@ def run_queue():
 
 def show_tasks(chat_id):
     tasks = task_list()
-    if not tasks and not QUARK_QUEUE and not QUARK_ACTIVE:
+    try:
+        aria_items = [item for item in aria2_recent() if item.get("gid") in ARIA2_TRACKED and item.get("status") in {"active", "waiting", "paused"}]
+    except Exception as exc:
+        print("aria2-task-list error:", exc, flush=True)
+        aria_items = []
+    if not tasks and not QUARK_QUEUE and not QUARK_ACTIVE and not aria_items:
         return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接、.torrent 文件。", home_keyboard())
     lines = []
     buttons = []
@@ -460,6 +517,9 @@ def show_tasks(chat_id):
         lines.append("☁️ 夸克转存 · 正在处理\n完成后会自动交给 Aria2")
     for position, item in enumerate(QUARK_QUEUE, start=1):
         lines.append(f"☁️ 夸克队列 {position}\n{item.get('name', '夸克任务')}")
+    for item in aria_items[:6]:
+        speed = int(item.get("downloadSpeed") or 0) / 1024 / 1024
+        lines.append(f"⚡ Aria2 · {aria2_percent(item):.0f}% · {item.get('status', '未知')}\n{aria2_name(item)[:42]}\n速度 {speed:.2f} MiB/s")
     for item in tasks[:6]:
         short_hash = item["hash"][:8]
         progress = item.get("progress", 0) * 100
@@ -505,12 +565,15 @@ def server_status(chat_id):
         info = json.loads(qbit("/api/v2/transfer/info"))
         tasks = task_list()
         disk = shutil.disk_usage("/downloads")
+        aria_stats = aria2_rpc("aria2.getGlobalStat")
     except Exception as exc:
         print("server-status error:", exc, flush=True)
         return send(chat_id, "🖥 状态暂时无法读取。\n请稍后点击 /start 再试。", [[{"text": "← 主菜单", "callback_data": "home:home"}]])
     download = info.get("dl_info_speed", 0) / 1024 / 1024
     upload = info.get("up_info_speed", 0) / 1024 / 1024
     active = sum(1 for item in tasks if item.get("progress", 0) < 1)
+    aria_active = int(aria_stats.get("numActive") or 0)
+    aria_speed = int(aria_stats.get("downloadSpeed") or 0) / 1024 / 1024
     used = disk.total - disk.free
     drive_capacity = google_drive_capacity()
     text = (
@@ -521,6 +584,7 @@ def server_status(chat_id):
         f"上传速度：{upload:.2f} MiB/s\n"
         f"活动任务：{active}\n"
         f"夸克转存队列：{len(QUARK_QUEUE) + (1 if QUARK_ACTIVE else 0)}\n\n"
+        f"Aria2：{aria_active} 个活动任务 · {aria_speed:.2f} MiB/s\n\n"
         f"VPS 下载盘：总 {disk.total / GIB:.1f} GB · 已用 {used / GIB:.1f} GB · 可用 {disk.free / GIB:.1f} GB\n"
         f"安全预留：{RESERVE_GIB} GB\n\n"
         f"Google Drive：{drive_capacity}\n\n"
@@ -723,12 +787,34 @@ def watch_completed():
     run_queue()
 
 
+def watch_aria2_completed():
+    changed = False
+    for gid, tracked in list(ARIA2_TRACKED.items()):
+        try:
+            item = aria2_rpc("aria2.tellStatus", [gid, ["gid", "status", "errorMessage", "files"]])
+        except Exception as exc:
+            print("aria2-watch error:", exc, flush=True)
+            continue
+        status = item.get("status")
+        if status == "complete" and not tracked.get("notified"):
+            tracked["notified"] = True
+            changed = True
+            send_temporary(OWNER, f"✅ Aria2 下载完成\n\n{tracked.get('name', aria2_name(item))}\n\nMoviePilot 已开始识别、整理并上传 Google Drive。")
+        elif status == "error":
+            send(OWNER, f"⚠️ Aria2 下载失败\n\n{tracked.get('name', aria2_name(item))}\n{item.get('errorMessage') or '请在我的任务中检查。'}")
+            ARIA2_TRACKED.pop(gid, None)
+            changed = True
+    if changed:
+        save_aria2_tracked()
+
+
 while True:
     try:
         updates = telegram("getUpdates", {"offset": OFFSET, "timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])})
         for update in updates.get("result", []):
             handle(update)
         watch_completed()
+        watch_aria2_completed()
         delete_expired_messages()
     except Exception as exc:
         print("error:", exc, flush=True)
