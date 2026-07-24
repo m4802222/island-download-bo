@@ -144,6 +144,15 @@ def qbit(path, data=None):
     return body
 
 
+def qbit_action(action, hashes, delete_files=False):
+    """Use qBittorrent 5 API names while keeping friendly bot action names."""
+    endpoint = {"pause": "stop", "resume": "start"}.get(action, action)
+    data = {"hashes": hashes}
+    if delete_files:
+        data["deleteFiles"] = "true"
+    return qbit(f"/api/v2/torrents/{endpoint}", data)
+
+
 def qbit_add_torrent_file(filename, content, category):
     """Upload a .torrent file to qBittorrent using its multipart API."""
     global COOKIE
@@ -324,7 +333,7 @@ def run_queue():
     for task_hash in QUEUE[MAX_ACTIVE_DOWNLOADS:]:
         item = task_by_hash.get(task_hash)
         if item and item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-            qbit("/api/v2/torrents/pause", {"hashes": task_hash})
+            qbit_action("pause", task_hash)
     free = shutil.disk_usage("/downloads").free
     available = max(0, free - RESERVE_GIB * GIB)
     for task_hash in active_hashes:
@@ -334,7 +343,7 @@ def run_queue():
         fits, size, _ = has_enough_space(item, available + RESERVE_GIB * GIB)
         if not fits:
             if item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-                qbit("/api/v2/torrents/pause", {"hashes": task_hash})
+                qbit_action("pause", task_hash)
             if task_hash not in BLOCKED:
                 BLOCKED.add(task_hash)
                 save_blocked()
@@ -345,7 +354,7 @@ def run_queue():
             BLOCKED.remove(task_hash)
             save_blocked()
         if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-            qbit("/api/v2/torrents/resume", {"hashes": task_hash})
+            qbit_action("resume", task_hash)
 
 
 def show_tasks(chat_id):
@@ -509,7 +518,7 @@ def legacy_command(chat_id, text):
         send(chat_id, "没有找到唯一任务，请在“我的任务”中选择。")
         return True
     command = parts[0][1:]
-    qbit(f"/api/v2/torrents/{command}", {"hashes": item["hash"], **({"deleteFiles": "true"} if command == "delete" else {})})
+    qbit_action(command, item["hash"], delete_files=command == "delete")
     if command in {"pause", "delete"} and item["hash"] in QUEUE:
         QUEUE.remove(item["hash"])
         save_queue()
@@ -551,7 +560,7 @@ def handle_callback(callback):
         item = find_task(short_hash)
         if not item:
             return send(chat_id, "任务不存在。", home_keyboard())
-        qbit(f"/api/v2/torrents/{action}", {"hashes": item["hash"]})
+        qbit_action(action, item["hash"])
         if action == "pause" and item["hash"] in QUEUE:
             QUEUE.remove(item["hash"])
             save_queue()
