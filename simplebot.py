@@ -520,7 +520,7 @@ def show_tasks(chat_id):
     completed_count = len(completed_qbit) + len(completed_aria)
     if not active_qbit and not QUARK_QUEUE and not QUARK_ACTIVE and not aria_items and not completed_count:
         return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接、.torrent 文件。", home_keyboard())
-    lines = ["📋 进行中"]
+    lines = []
     buttons = []
     if QUARK_ACTIVE:
         lines.append("☁️ 夸克转存 · 正在处理\n完成后会自动交给 Aria2")
@@ -534,7 +534,9 @@ def show_tasks(chat_id):
     if completed_count:
         buttons.append([{"text": f"已完成 {completed_count} 项", "callback_data": "home:completed"}])
     buttons.append([{"text": "刷新", "callback_data": "home:tasks"}, {"text": "← 主菜单", "callback_data": "home:home"}])
-    send(chat_id, "📋 下载任务\n\n" + "\n\n".join(lines), buttons)
+    # Telegram requires every inline keyboard to be attached to a message.
+    # U+2060 keeps that message visually empty, leaving only the buttons.
+    send(chat_id, "\u2060", buttons)
 
 
 def show_recent_completed(chat_id):
