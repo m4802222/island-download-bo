@@ -47,6 +47,8 @@ INCOMING_DIR.mkdir(exist_ok=True)
 MAX_TORRENT_BYTES = 20 * 1024 * 1024
 QUARK_QUEUE_FILE = DATA_DIR / "quark_queue.json"
 QUARK_QUEUE = list(json.loads(QUARK_QUEUE_FILE.read_text())) if QUARK_QUEUE_FILE.exists() else []
+QUARK_PENDING_FILE = DATA_DIR / "quark_pending.json"
+QUARK_PENDING = json.loads(QUARK_PENDING_FILE.read_text()) if QUARK_PENDING_FILE.exists() else {}
 QUARK_ACTIVE = False
 QUARK_LOCK = threading.Lock()
 ARIA2_FILE = DATA_DIR / "aria2.json"
@@ -96,6 +98,10 @@ def json_request(url, payload, timeout=100):
 
 def save_quark_queue():
     QUARK_QUEUE_FILE.write_text(json.dumps(QUARK_QUEUE, ensure_ascii=False))
+
+
+def save_quark_pending():
+    QUARK_PENDING_FILE.write_text(json.dumps(QUARK_PENDING, ensure_ascii=False))
 
 
 def save_aria2_tracked():
@@ -181,6 +187,38 @@ def qas_task(share_url, task_name):
     }
 
 
+def qas_share_folders(share_url):
+    """Return the first-level folders of a shared Quark link."""
+    response = qas_open("/get_share_detail", {"shareurl": share_url}, timeout=90)
+    payload = json.loads(response.read().decode(errors="replace"))
+    if not payload.get("success"):
+        error = payload.get("data", {}).get("error") or payload.get("message") or "夸克链接解析失败"
+        raise RuntimeError(error)
+    entries = payload.get("data", {}).get("list", [])
+    return [
+        {"fid": item["fid"], "name": item["file_name"]}
+        for item in entries
+        if item.get("dir") and item.get("fid") and item.get("file_name")
+    ]
+
+
+def selected_share_url(share_url, folder):
+    """QAS supports a share URL with a folder fid in its fragment."""
+    base = share_url.split("#", 1)[0]
+    name = urllib.parse.quote(folder["name"], safe="")
+    return f"{base}#/list/share/{folder['fid']}-{name}"
+
+
+def enqueue_quark_task(chat_id, share_url):
+    task = {"url": share_url, "name": f"夸克任务-{time.strftime('%m%d-%H%M%S')}"}
+    with QUARK_LOCK:
+        QUARK_QUEUE.append(task)
+        save_quark_queue()
+        position = len(QUARK_QUEUE) + (1 if QUARK_ACTIVE else 0)
+    send_temporary(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}\n夸克转存 → Aria2 → MoviePilot → Google Drive", lifetime_seconds=12)
+    run_quark_queue()
+
+
 def run_quark_queue():
     """Run one QAS transfer at a time; QAS then dispatches files to Aria2."""
     global QUARK_ACTIVE
@@ -216,17 +254,29 @@ def run_quark_queue():
 
 
 def add_quark_share(chat_id, share_url, source_message_id):
-    task = {"url": share_url, "name": f"夸克任务-{time.strftime('%m%d-%H%M%S')}", "source_message_id": source_message_id}
-    with QUARK_LOCK:
-        QUARK_QUEUE.append(task)
-        save_quark_queue()
-        position = len(QUARK_QUEUE) + (1 if QUARK_ACTIVE else 0)
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": source_message_id})
     except Exception as exc:
         print("delete-quark-source error:", exc, flush=True)
-    send_temporary(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}\n夸克转存 → Aria2 → MoviePilot → Google Drive", lifetime_seconds=12)
-    run_quark_queue()
+    def worker():
+        try:
+            folders = qas_share_folders(share_url)
+            if len(folders) <= 1:
+                return enqueue_quark_task(chat_id, share_url)
+            key = uuid.uuid4().hex[:10]
+            QUARK_PENDING[key] = {"url": share_url, "folders": folders, "created_at": time.time()}
+            save_quark_pending()
+            buttons = [
+                [{"text": f"📁 {folder['name'][:42]}", "callback_data": f"quarkselect:{key}:{index}"}]
+                for index, folder in enumerate(folders)
+            ]
+            return send(chat_id, "发现多个文件夹，请选择要下载的版本：", buttons)
+        except Exception as exc:
+            print("quark-share-parse error:", exc, flush=True)
+            return send(chat_id, f"⚠️ 夸克链接解析失败\n\n{str(exc)[:160]}", home_keyboard())
+
+    send_temporary(chat_id, "☁️ 正在解析夸克分享内容…", lifetime_seconds=12)
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def ai_reply(question):
@@ -812,6 +862,18 @@ def handle_callback(callback):
         return show_recent_completed(chat_id)
     if data == "home:server":
         return server_status(chat_id)
+    if data.startswith("quarkselect:"):
+        _, key, index_text = data.split(":", 2)
+        pending = QUARK_PENDING.pop(key, None)
+        save_quark_pending()
+        if not pending:
+            return send(chat_id, "这个夸克选择已过期，请重新发送分享链接。", home_keyboard())
+        try:
+            folder = pending["folders"][int(index_text)]
+        except (ValueError, IndexError):
+            return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
+        enqueue_quark_task(chat_id, selected_share_url(pending["url"], folder))
+        return send_temporary(chat_id, f"已选择：{folder['name']}", lifetime_seconds=12)
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
     if data.startswith("task:"):
