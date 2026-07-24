@@ -513,27 +513,44 @@ def show_tasks(chat_id):
     except Exception as exc:
         print("aria2-task-list error:", exc, flush=True)
         aria_items = []
-    if not tasks and not QUARK_QUEUE and not QUARK_ACTIVE and not aria_items:
+    active_qbit = [item for item in tasks if item.get("progress", 0) < 1]
+    cutoff = time.time() - 24 * 60 * 60
+    completed_qbit = [item for item in tasks if item.get("progress", 0) >= 1 and item.get("completion_on", 0) >= cutoff]
+    completed_aria = [item for item in ARIA2_TRACKED.values() if item.get("notified")]
+    completed_count = len(completed_qbit) + len(completed_aria)
+    if not active_qbit and not QUARK_QUEUE and not QUARK_ACTIVE and not aria_items and not completed_count:
         return send(chat_id, "暂无机器人添加的任务。\n\n点击“添加下载”或直接发送 magnet 链接、.torrent 文件。", home_keyboard())
-    lines = []
+    lines = ["📋 进行中"]
     buttons = []
     if QUARK_ACTIVE:
         lines.append("☁️ 夸克转存 · 正在处理\n完成后会自动交给 Aria2")
     for position, item in enumerate(QUARK_QUEUE, start=1):
         lines.append(f"☁️ 夸克队列 {position}\n{item.get('name', '夸克任务')}")
     for item in aria_items[:6]:
-        speed = int(item.get("downloadSpeed") or 0) / 1024 / 1024
-        lines.append(f"⚡ Aria2 · {aria2_percent(item):.0f}% · {item.get('status', '未知')}\n{aria2_name(item)[:42]}\n速度 {speed:.2f} MiB/s")
-    for item in tasks[:6]:
+        lines.append(f"⚡ {aria2_name(item)[:34]}\n{aria2_percent(item):.0f}% · {item.get('status', '未知')}")
+        buttons.append([{"text": f"查看 {aria2_name(item)[:18]}", "callback_data": f"aria:{item['gid'][:8]}"}])
+    for item in active_qbit[:6]:
         short_hash = item["hash"][:8]
-        progress = item.get("progress", 0) * 100
-        state = item.get("state", "未知")
-        category = item.get("category") or "智能分类（MoviePilot）"
-        position = QUEUE.index(item["hash"]) + 1 if item["hash"] in QUEUE else "—"
-        lines.append(f"队列 {position} · {progress:.0f}% · {state}\n{item.get('name', '')[:42]}\n{category}")
+        lines.append(f"⬇️ {item.get('name', '')[:34]}\n{item.get('progress', 0) * 100:.0f}% · {item.get('state', '未知')}")
         buttons.append([{"text": f"查看 {short_hash}", "callback_data": f"task:{short_hash}"}])
+    if completed_count:
+        buttons.append([{"text": f"已完成 {completed_count} 项", "callback_data": "home:completed"}])
     buttons.append([{"text": "← 主菜单", "callback_data": "home:home"}])
     send(chat_id, "📋 下载任务\n\n" + "\n\n".join(lines), buttons)
+
+
+def show_recent_completed(chat_id):
+    cutoff = time.time() - 24 * 60 * 60
+    items = [item for item in task_list() if item.get("progress", 0) >= 1 and item.get("completion_on", 0) >= cutoff]
+    lines = ["✅ 最近 24 小时完成"]
+    for item in sorted(items, key=lambda value: value.get("completion_on", 0), reverse=True)[:8]:
+        lines.append(f"{item.get('name', '')[:52]}\n已完成")
+    for item in list(ARIA2_TRACKED.values())[-8:]:
+        if item.get("notified"):
+            lines.append(f"{item.get('name', 'Aria2 文件')[:52]}\n已交给 MoviePilot")
+    if len(lines) == 1:
+        lines.append("暂无最近完成的任务。")
+    send(chat_id, "\n\n".join(lines), [[{"text": "← 下载任务", "callback_data": "home:tasks"}]])
 
 
 def find_task(short_hash):
@@ -562,6 +579,24 @@ def show_task(chat_id, short_hash):
         [{"text": "← 任务列表", "callback_data": "home:tasks"}],
     ]
     send(chat_id, text, keyboard)
+
+
+def show_aria_task(chat_id, short_gid):
+    matches = [item for item in aria2_recent() if item.get("gid", "").startswith(short_gid)]
+    if len(matches) != 1:
+        return send(chat_id, "Aria2 任务不存在或已被清理。", [[{"text": "← 下载任务", "callback_data": "home:tasks"}]])
+    item = matches[0]
+    total = int(item.get("totalLength") or 0) / GIB
+    done = int(item.get("completedLength") or 0) / GIB
+    speed = int(item.get("downloadSpeed") or 0) / 1024 / 1024
+    text = (
+        f"⚡ {aria2_name(item)}\n\n"
+        f"进度：{aria2_percent(item):.1f}%\n"
+        f"状态：{item.get('status', '未知')}\n"
+        f"大小：{done:.2f} / {total:.2f} GB\n"
+        f"速度：{speed:.2f} MiB/s"
+    )
+    send(chat_id, text, [[{"text": "← 下载任务", "callback_data": "home:tasks"}]])
 
 
 def server_status(chat_id):
@@ -715,12 +750,16 @@ def handle_callback(callback):
         return send(chat_id, "请发送 magnet、夸克分享链接，或上传 .torrent 种子文件。\n系统会自动交给 MoviePilot 智能分类。", [[{"text": "返回主页", "callback_data": "home:home"}]])
     if data == "home:tasks":
         return show_tasks(chat_id)
+    if data == "home:completed":
+        return show_recent_completed(chat_id)
     if data == "home:server":
         return server_status(chat_id)
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
     if data.startswith("task:"):
         return show_task(chat_id, data.split(":", 1)[1])
+    if data.startswith("aria:"):
+        return show_aria_task(chat_id, data.split(":", 1)[1])
     if data.startswith("action:"):
         _, action, short_hash = data.split(":", 2)
         item = find_task(short_hash)
