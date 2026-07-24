@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -184,17 +185,27 @@ def extract_post_title(text):
         return None
 
 
-def qas_open(path, payload=None, timeout=1800):
+def qas_open(path, payload=None, timeout=45):
     """Log in to QAS for one request and return its response."""
     if not QAS_USER or not QAS_PASSWORD:
         raise RuntimeError("夸克模块尚未配置 QAS 账号")
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    login_body = urllib.parse.urlencode({"username": QAS_USER, "password": QAS_PASSWORD}).encode()
-    opener.open(urllib.request.Request(f"{QAS_URL}/login", login_body), timeout=30).read()
-    headers = {"Content-Type": "application/json"}
-    body = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
-    return opener.open(urllib.request.Request(f"{QAS_URL}{path}", body, headers), timeout=timeout)
+    last_error = None
+    # QAS can occasionally leave one Quark request hanging. Retry once with a
+    # fresh web session instead of making the Telegram user resend the post.
+    for attempt in range(2):
+        try:
+            jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+            login_body = urllib.parse.urlencode({"username": QAS_USER, "password": QAS_PASSWORD}).encode()
+            opener.open(urllib.request.Request(f"{QAS_URL}/login", login_body), timeout=20).read()
+            headers = {"Content-Type": "application/json"}
+            body = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
+            return opener.open(urllib.request.Request(f"{QAS_URL}{path}", body, headers), timeout=timeout)
+        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(2)
+    raise RuntimeError(f"夸克解析超时：{last_error}")
 
 
 def media_folder_name(title):
@@ -259,19 +270,23 @@ def qas_task(share_url, task_name, media_title=None):
     }
 
 
-def qas_share_folders(share_url):
+def qas_share_folders(share_url, stoken=None):
     """Return the first-level folders of a shared Quark link."""
-    response = qas_open("/get_share_detail", {"shareurl": share_url}, timeout=90)
+    payload = {"shareurl": share_url}
+    if stoken:
+        payload["stoken"] = stoken
+    response = qas_open("/get_share_detail", payload)
     payload = json.loads(response.read().decode(errors="replace"))
     if not payload.get("success"):
         error = payload.get("data", {}).get("error") or payload.get("message") or "夸克链接解析失败"
         raise RuntimeError(error)
     entries = payload.get("data", {}).get("list", [])
-    return [
+    folders = [
         {"fid": item["fid"], "name": item["file_name"]}
         for item in entries
         if item.get("dir") and item.get("fid") and item.get("file_name")
     ]
+    return folders, payload.get("data", {}).get("stoken")
 
 
 def qas_download_choices(share_url, max_depth=5):
@@ -283,8 +298,9 @@ def qas_download_choices(share_url, max_depth=5):
     """
     current_url = share_url
     title_hint = None
+    stoken = None
     for _ in range(max_depth):
-        folders = qas_share_folders(current_url)
+        folders, stoken = qas_share_folders(current_url, stoken)
         if len(folders) != 1:
             return current_url, folders, title_hint
         wrapper = folders[0]
@@ -294,7 +310,8 @@ def qas_download_choices(share_url, max_depth=5):
         current_url = selected_share_url(current_url, wrapper)
     # Never choose an arbitrary nested folder if the hierarchy is unusually
     # deep; let the user see the final folder instead.
-    return current_url, qas_share_folders(current_url), title_hint
+    folders, _ = qas_share_folders(current_url, stoken)
+    return current_url, folders, title_hint
 
 
 def selected_share_url(share_url, folder):
