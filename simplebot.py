@@ -168,21 +168,29 @@ def extract_quark_share(text):
 
 
 def extract_post_title(text):
-    """Read the media name from a post line such as '🎬 悬案 (2026) 4K ...'."""
-    match = re.search(r"(?:^|\n)\s*🎬\s*([^\n]+)", text)
-    if not match:
-        return None
-    heading = match.group(1).strip()
-    # Release notes follow the first bracket. Prefer the normal title + year
-    # before it, e.g. '悬案 (2026)' from a channel post.
-    heading = re.split(r"\s*\[", heading, maxsplit=1)[0].strip()
-    year = re.match(r"^(.*?(?:\(\d{4}\)|（\d{4}）))", heading)
-    title = year.group(1) if year else heading
-    title = re.sub(r"\s+(?:4K|2160[Pp]|1080[Pp]|720[Pp])\b.*$", "", title).strip()
-    try:
-        return media_folder_name(title)
-    except RuntimeError:
-        return None
+    """Read the title and year from a forwarded channel post.
+
+    Telegram forwarding can alter or omit the leading movie emoji, so do not
+    rely on the emoji alone. The first ordinary line containing Chinese text
+    plus a four-digit year is the explicit metadata supplied by the post.
+    """
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not re.search(r"[\u4e00-\u9fff]", line):
+            continue
+        match = re.search(r"(.+?[（(]\d{4}[)）])", line)
+        if not match:
+            continue
+        title = match.group(1)
+        title = re.sub(r"^[^\w\u4e00-\u9fff]+", "", title).strip()
+        # Ignore metadata lines such as '发布时间：2026-07-24'.
+        if any(label in title for label in ("发布时间", "资源大小", "链接状态", "投稿ID")):
+            continue
+        try:
+            return media_folder_name(title)
+        except RuntimeError:
+            return None
+    return None
 
 
 def qas_open(path, payload=None, timeout=45):
@@ -386,7 +394,9 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
                     return enqueue_quark_task(chat_id, base_url, title_hint)
                 folder = folders[0]
                 selected_url = selected_share_url(base_url, folder)
-                title = folder_media_title(folder["name"]) or title_hint
+                # A title extracted from the forwarded post is explicit
+                # metadata; never replace it with a malformed Quark folder.
+                title = title_hint or folder_media_title(folder["name"])
                 if title:
                     return enqueue_quark_task(chat_id, selected_url, title)
                 return request_quark_title(chat_id, selected_url, folder["name"])
