@@ -249,6 +249,29 @@ def qas_share_folders(share_url):
     ]
 
 
+def qas_download_choices(share_url, max_depth=5):
+    """Walk harmless wrapper folders until a real choice is reached.
+
+    A common Quark layout is: share root -> "Drama name" ->
+    "Season 1 (HQ)" / "Season 1 (SDR)". The former is a wrapper, not a
+    download choice. Keep its title as a hint for MoviePilot.
+    """
+    current_url = share_url
+    title_hint = None
+    for _ in range(max_depth):
+        folders = qas_share_folders(current_url)
+        if len(folders) != 1:
+            return current_url, folders, title_hint
+        wrapper = folders[0]
+        inferred = folder_media_title(wrapper["name"])
+        if inferred:
+            title_hint = inferred
+        current_url = selected_share_url(current_url, wrapper)
+    # Never choose an arbitrary nested folder if the hierarchy is unusually
+    # deep; let the user see the final folder instead.
+    return current_url, qas_share_folders(current_url), title_hint
+
+
 def selected_share_url(share_url, folder):
     """QAS supports a share URL with a folder fid in its fragment."""
     base = share_url.split("#", 1)[0]
@@ -312,18 +335,23 @@ def add_quark_share(chat_id, share_url, source_message_id):
         print("delete-quark-source error:", exc, flush=True)
     def worker():
         try:
-            folders = qas_share_folders(share_url)
+            base_url, folders, title_hint = qas_download_choices(share_url)
             if len(folders) <= 1:
                 if not folders:
-                    return enqueue_quark_task(chat_id, share_url)
+                    return enqueue_quark_task(chat_id, base_url, title_hint)
                 folder = folders[0]
-                selected_url = selected_share_url(share_url, folder)
-                title = folder_media_title(folder["name"])
+                selected_url = selected_share_url(base_url, folder)
+                title = folder_media_title(folder["name"]) or title_hint
                 if title:
                     return enqueue_quark_task(chat_id, selected_url, title)
                 return request_quark_title(chat_id, selected_url, folder["name"])
             key = uuid.uuid4().hex[:10]
-            QUARK_PENDING[key] = {"url": share_url, "folders": folders, "created_at": time.time()}
+            QUARK_PENDING[key] = {
+                "url": base_url,
+                "folders": folders,
+                "title_hint": title_hint,
+                "created_at": time.time(),
+            }
             save_quark_pending()
             buttons = [
                 [{"text": f"📁 {folder['name'][:42]}", "callback_data": f"quarkselect:{key}:{index}"}]
@@ -932,7 +960,7 @@ def handle_callback(callback):
         except (ValueError, IndexError):
             return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
         selected_url = selected_share_url(pending["url"], folder)
-        title = folder_media_title(folder["name"])
+        title = folder_media_title(folder["name"]) or pending.get("title_hint")
         if title:
             return enqueue_quark_task(chat_id, selected_url, title)
         return request_quark_title(chat_id, selected_url, folder["name"])
