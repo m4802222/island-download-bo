@@ -534,9 +534,8 @@ def show_tasks(chat_id):
     if completed_count:
         buttons.append([{"text": f"已完成 {completed_count} 项", "callback_data": "home:completed"}])
     buttons.append([{"text": "刷新", "callback_data": "home:tasks"}, {"text": "← 主菜单", "callback_data": "home:home"}])
-    # Telegram requires every inline keyboard to be attached to a message.
-    # U+2060 keeps that message visually empty, leaving only the buttons.
-    send(chat_id, "\u2060", buttons)
+    is_downloading = bool(active_qbit or QUARK_QUEUE or QUARK_ACTIVE or aria_items)
+    send(chat_id, "📥 下载中" if is_downloading else "当前无下载任务", buttons)
 
 
 def show_recent_completed(chat_id):
