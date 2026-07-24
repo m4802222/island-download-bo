@@ -203,7 +203,7 @@ def run_quark_queue():
             for item in added:
                 ARIA2_TRACKED[item["gid"]] = {"name": aria2_name(item), "notified": False}
             save_aria2_tracked()
-            send_temporary(OWNER, f"☁️ 已转存并交给 Aria2 下载\n\n{task['name']}\n\n下载完成后，MoviePilot 会自动整理并上传 Google Drive。")
+            send_temporary(OWNER, f"☁️ 已转存并交给 Aria2 下载\n\n{task['name']}\n\nMoviePilot 会在完成后自动整理并上传 Google Drive。", lifetime_seconds=12)
         except Exception as exc:
             print("quark-queue error:", exc, flush=True)
             send(OWNER, f"⚠️ 夸克任务失败\n\n{task['name']}\n{str(exc)[:160]}")
@@ -225,7 +225,7 @@ def add_quark_share(chat_id, share_url, source_message_id):
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": source_message_id})
     except Exception as exc:
         print("delete-quark-source error:", exc, flush=True)
-    send(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}\n流程：夸克转存 → Aria2 → MoviePilot → Google Drive")
+    send_temporary(chat_id, f"☁️ 夸克链接已进入队列\n\n队列位置：{position}\n夸克转存 → Aria2 → MoviePilot → Google Drive", lifetime_seconds=12)
     run_quark_queue()
 
 
@@ -528,11 +528,11 @@ def show_tasks(chat_id):
         lines.append(f"☁️ 夸克队列 {position}\n{item.get('name', '夸克任务')}")
     for item in aria_items[:6]:
         lines.append(f"⚡ {aria2_name(item)[:34]}\n{aria2_percent(item):.0f}% · {item.get('status', '未知')}")
-        buttons.append([{"text": f"查看 {aria2_name(item)[:18]}", "callback_data": f"aria:{item['gid'][:8]}"}])
+        buttons.append([{"text": "详情", "callback_data": f"aria:{item['gid'][:8]}"}, {"text": "刷新", "callback_data": "home:tasks"}])
     for item in active_qbit[:6]:
         short_hash = item["hash"][:8]
         lines.append(f"⬇️ {item.get('name', '')[:34]}\n{item.get('progress', 0) * 100:.0f}% · {item.get('state', '未知')}")
-        buttons.append([{"text": f"查看 {short_hash}", "callback_data": f"task:{short_hash}"}])
+        buttons.append([{"text": "详情", "callback_data": f"task:{short_hash}"}, {"text": "刷新", "callback_data": "home:tasks"}])
     if completed_count:
         buttons.append([{"text": f"已完成 {completed_count} 项", "callback_data": "home:completed"}])
     buttons.append([{"text": "← 主菜单", "callback_data": "home:home"}])
