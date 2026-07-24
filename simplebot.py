@@ -181,6 +181,34 @@ def media_folder_name(title):
     return name[:96]
 
 
+def folder_media_title(folder_name):
+    """Return the original folder name only when it actually contains a title.
+
+    Generic names such as ``Season 1 (HQ.DV.60fps)`` have no identity for
+    MoviePilot to search, while ``悬案 Season 1 (HQ...)`` does.
+    """
+    probe = folder_name
+    probe = re.sub(r"(?i)\b(?:season|s)\s*\d{1,3}\b", " ", probe)
+    probe = re.sub(r"第\s*\d+\s*[季集]|第?[一二三四五六七八九十]+季", " ", probe)
+    probe = re.sub(r"(?i)\b(?:2160p|1080p|720p|4k|uhd|web[ ._-]*dl|bluray|remux|h\.?265|hevc|h\.?264|x265|x264|hdr|dv|dovi|60fps|50fps|10bit|8bit|aac|ddp|dts|atmos|hq|sdr)\b", " ", probe)
+    probe = re.sub(r"[\[\]()._\-\s]+", "", probe)
+    # At least a Chinese character or a three-letter word must remain. This
+    # rejects technical-only folder names without guessing a media title.
+    if re.search(r"[\u4e00-\u9fff]|[A-Za-z]{3,}", probe):
+        return media_folder_name(folder_name)
+    return None
+
+
+def request_quark_title(chat_id, share_url, folder_name):
+    QUARK_TITLE_PENDING[str(chat_id)] = {
+        "url": share_url,
+        "folder": folder_name,
+        "created_at": time.time(),
+    }
+    save_quark_title_pending()
+    return send(chat_id, f"已选择：{folder_name}\n\n这个目录没有剧名。请输入剧名和年份，例如：\n鱿鱼游戏 (2021)\n\n输入 /cancel 可取消。")
+
+
 def qas_task(share_url, task_name, media_title=None):
     # QAS's Aria2 plugin flattens the source tree when save_path is set. Put a
     # title in the destination path so MoviePilot sees e.g. "剧名 (年份)/S01E02".
@@ -286,7 +314,14 @@ def add_quark_share(chat_id, share_url, source_message_id):
         try:
             folders = qas_share_folders(share_url)
             if len(folders) <= 1:
-                return enqueue_quark_task(chat_id, share_url)
+                if not folders:
+                    return enqueue_quark_task(chat_id, share_url)
+                folder = folders[0]
+                selected_url = selected_share_url(share_url, folder)
+                title = folder_media_title(folder["name"])
+                if title:
+                    return enqueue_quark_task(chat_id, selected_url, title)
+                return request_quark_title(chat_id, selected_url, folder["name"])
             key = uuid.uuid4().hex[:10]
             QUARK_PENDING[key] = {"url": share_url, "folders": folders, "created_at": time.time()}
             save_quark_pending()
@@ -896,16 +931,11 @@ def handle_callback(callback):
             folder = pending["folders"][int(index_text)]
         except (ValueError, IndexError):
             return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
-        # The selected folders can be generic names such as "Season 1 (HQ)".
-        # Asking once for the actual title is the only non-guessing way to give
-        # MoviePilot enough metadata when every file is only named S01E02, etc.
-        QUARK_TITLE_PENDING[str(chat_id)] = {
-            "url": selected_share_url(pending["url"], folder),
-            "folder": folder["name"],
-            "created_at": time.time(),
-        }
-        save_quark_title_pending()
-        return send(chat_id, f"已选择：{folder['name']}\n\n请输入剧名和年份，例如：\n鱿鱼游戏 (2021)\n\n输入 /cancel 可取消。")
+        selected_url = selected_share_url(pending["url"], folder)
+        title = folder_media_title(folder["name"])
+        if title:
+            return enqueue_quark_task(chat_id, selected_url, title)
+        return request_quark_title(chat_id, selected_url, folder["name"])
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
     if data.startswith("task:"):
