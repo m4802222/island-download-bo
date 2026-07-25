@@ -58,6 +58,8 @@ QUARK_ACTIVE = False
 QUARK_LOCK = threading.Lock()
 ARIA2_FILE = DATA_DIR / "aria2.json"
 ARIA2_TRACKED = json.loads(ARIA2_FILE.read_text()) if ARIA2_FILE.exists() else {}
+HERMES_INBOX_FILE = DATA_DIR / "hermes_inbox.json"
+HERMES_INBOX_LOCK = threading.Lock()
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 QUARK_URL_RE = re.compile(r"https?://pan\.quark\.cn/s/[A-Za-z0-9]+(?:\?[^\s]*)?", re.IGNORECASE)
@@ -117,6 +119,20 @@ def save_quark_title_pending():
 
 def save_aria2_tracked():
     ARIA2_FILE.write_text(json.dumps(ARIA2_TRACKED, ensure_ascii=False))
+
+
+def hermes_jobs():
+    """Read the local Hermes inbox. It never contains credentials."""
+    try:
+        return json.loads(HERMES_INBOX_FILE.read_text()) if HERMES_INBOX_FILE.exists() else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_hermes_jobs(jobs):
+    temporary = HERMES_INBOX_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(jobs, ensure_ascii=False, indent=2))
+    temporary.replace(HERMES_INBOX_FILE)
 
 
 def aria2_rpc(method, params=None):
@@ -521,6 +537,64 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def process_hermes_inbox():
+    """Execute local Hermes jobs without sending messages from this bot.
+
+    A job can pause at ``needs_folder`` or ``needs_title``.  Hermes reads that
+    state and asks the user in its own Telegram chat, then updates the same job
+    with ``folder_index`` or ``media_title`` for the next pass.
+    """
+    with HERMES_INBOX_LOCK:
+        jobs = hermes_jobs()
+        changed = False
+        for job in jobs:
+            state = job.get("state", "pending")
+            kind = job.get("kind")
+            title = job.get("media_title")
+            try:
+                if state == "pending" and kind == "magnet":
+                    add_magnet(0, OWNER, job["url"], 0, title)
+                    job.update({"state": "submitted", "updated_at": time.time()})
+                    changed = True
+                elif kind == "quark" and state in {"pending", "needs_folder", "needs_title"}:
+                    if state == "needs_title" and not title:
+                        continue
+                    base_url, folders, folder_title_hint = qas_download_choices(job["url"])
+                    title = title or folder_title_hint
+                    selected_index = job.get("folder_index")
+                    if len(folders) > 1 and selected_index is None:
+                        job.update({
+                            "state": "needs_folder",
+                            "options": [folder["name"] for folder in folders],
+                            "updated_at": time.time(),
+                        })
+                        changed = True
+                        continue
+                    if folders:
+                        if selected_index is None:
+                            selected_index = 0
+                        selected_index = int(selected_index)
+                        if selected_index < 0 or selected_index >= len(folders):
+                            raise RuntimeError("文件夹选择无效")
+                        folder = folders[selected_index]
+                        selected_url = selected_share_url(base_url, folder)
+                        title = title or folder_media_title(folder["name"])
+                    else:
+                        selected_url = base_url
+                    if not title:
+                        job.update({"state": "needs_title", "updated_at": time.time()})
+                        changed = True
+                        continue
+                    enqueue_quark_task(0, selected_url, title)
+                    job.update({"state": "submitted", "media_title": title, "updated_at": time.time()})
+                    changed = True
+            except Exception as exc:
+                job.update({"state": "error", "error": str(exc)[:180], "updated_at": time.time()})
+                changed = True
+        if changed:
+            save_hermes_jobs(jobs)
+
+
 def ai_reply(question):
     system = (
         "你是 IslandDownload 的私人中文助手。回答简洁、实用，不超过 120 个汉字。"
@@ -699,6 +773,10 @@ def telegram(method, data):
 
 
 def send(chat_id, text, keyboard=None):
+    # Hermes submits jobs through a local file inbox.  Those jobs must not
+    # produce a second Telegram conversation from IslandDownloadBot.
+    if not chat_id:
+        return {"result": {}}
     payload = {"chat_id": chat_id, "text": text}
     if keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard}, ensure_ascii=False)
@@ -706,6 +784,8 @@ def send(chat_id, text, keyboard=None):
 
 
 def send_temporary(chat_id, text, lifetime_seconds=300):
+    if not chat_id:
+        return
     response = send(chat_id, text)
     message_id = response.get("result", {}).get("message_id")
     if message_id:
@@ -1362,6 +1442,7 @@ while True:
         updates = telegram("getUpdates", {"offset": OFFSET, "timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])})
         for update in updates.get("result", []):
             handle(update)
+        process_hermes_inbox()
         watch_completed()
         watch_aria2_completed()
         delete_expired_messages()
