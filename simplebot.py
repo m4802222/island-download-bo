@@ -61,6 +61,7 @@ ARIA2_TRACKED = json.loads(ARIA2_FILE.read_text()) if ARIA2_FILE.exists() else {
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 QUARK_URL_RE = re.compile(r"https?://pan\.quark\.cn/s/[A-Za-z0-9]+(?:\?[^\s]*)?", re.IGNORECASE)
+MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s]*", re.IGNORECASE)
 
 
 def request(url, data=None, headers=None):
@@ -165,6 +166,12 @@ def is_quark_share(text):
 def extract_quark_share(text):
     """Find a Quark link even when it is embedded in a forwarded post."""
     match = QUARK_URL_RE.search(text)
+    return match.group(0).rstrip(".,，。;；)") if match else None
+
+
+def extract_magnet(text):
+    """Find a magnet link even when it is inside a forwarded media post."""
+    match = MAGNET_RE.search(text)
     return match.group(0).rstrip(".,，。;；)") if match else None
 
 
@@ -607,7 +614,10 @@ def qbit_add_torrent_file(filename, content, category):
     body.extend(b"\r\n")
     field("tags", "islandbot")
     field("autoTMM", "false")
-    field("paused", "true")
+    # Let qBittorrent obtain metadata, then stop before file data downloads.
+    # This gives us a safe point to deselect episodes already uploaded by
+    # MoviePilot.  qBittorrent Web API supports this stop condition.
+    field("stopCondition", "MetadataReceived")
     if category != "__auto__":
         field("category", category)
     body.extend(f"--{boundary}--\r\n".encode())
@@ -620,6 +630,65 @@ def qbit_add_torrent_file(filename, content, category):
         status, response, _ = raw_request(f"{QBIT_URL}/api/v2/torrents/add", bytes(body), headers)
     if status >= 300:
         raise RuntimeError(response.decode(errors="replace")[:180])
+
+
+def qbit_files(torrent_hash):
+    """Return qBittorrent's indexed file list for one torrent."""
+    return json.loads(qbit(f"/api/v2/torrents/files?hash={torrent_hash}"))
+
+
+def wait_qbit_files(torrent_hash, attempts=40):
+    """Wait only for torrent metadata; never start payload downloading here."""
+    last_error = None
+    for _ in range(attempts):
+        try:
+            files = qbit_files(torrent_hash)
+            if files:
+                return files
+        except Exception as exc:
+            last_error = exc
+        time.sleep(1)
+    raise RuntimeError(f"种子元数据未在 {attempts} 秒内就绪：{last_error or '未返回文件列表'}")
+
+
+def apply_moviepilot_dedupe(torrent_hash, media_title):
+    """Disable already-uploaded video episodes before the torrent is queued.
+
+    MoviePilot's successful transfer history is the source of truth: only files
+    with an SxxExx key already recorded there are made unwanted in qBittorrent.
+    A movie without episode labels is skipped only when the same title has a
+    successful history record.
+    """
+    files = wait_qbit_files(torrent_hash)
+    videos = [
+        item for item in files
+        if str(item.get("name", "")).lower().endswith(VIDEO_EXTENSIONS)
+    ]
+    if not videos:
+        return {"total": 0, "skipped": 0, "remaining": 0}
+    if not media_title:
+        # A raw magnet normally has no trustworthy title. Do not guess and do
+        # not risk excluding the wrong media; channel posts supply this title.
+        return {"total": len(videos), "skipped": 0, "remaining": len(videos)}
+
+    existing_episodes, has_history = moviepilot_existing(media_title)
+    skip_ids = []
+    has_episode_labels = any(episode_key(item.get("name", "")) for item in videos)
+    for item in videos:
+        key = episode_key(item.get("name", ""))
+        if (key and key in existing_episodes) or (not has_episode_labels and has_history):
+            skip_ids.append(str(item.get("index")))
+
+    if skip_ids:
+        qbit(
+            "/api/v2/torrents/filePrio",
+            {"hash": torrent_hash, "id": "|".join(skip_ids), "priority": "0"},
+        )
+    return {
+        "total": len(videos),
+        "skipped": len(skip_ids),
+        "remaining": len(videos) - len(skip_ids),
+    }
 
 
 def telegram(method, data):
@@ -976,11 +1045,15 @@ def server_status(chat_id):
     send(chat_id, text, [[{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}]])
 
 
-def add_magnet(chat_id, user_id, magnet, source_message_id):
+def add_magnet(chat_id, user_id, magnet, source_message_id, media_title=None):
     old = PENDING.get(user_id)
     if old and old.get("torrent_path"):
         Path(old["torrent_path"]).unlink(missing_ok=True)
-    PENDING[user_id] = {"magnet": magnet, "source_message_id": source_message_id}
+    PENDING[user_id] = {
+        "magnet": magnet,
+        "source_message_id": source_message_id,
+        "media_title": media_title,
+    }
     return add_to_qbit(chat_id, user_id, "__auto__")
 
 
@@ -995,7 +1068,7 @@ def download_telegram_file(file_id):
     return content
 
 
-def add_torrent_file(chat_id, user_id, document, source_message_id):
+def add_torrent_file(chat_id, user_id, document, source_message_id, media_title=None):
     filename = document.get("file_name") or "download.torrent"
     size = int(document.get("file_size") or 0)
     if not filename.lower().endswith(".torrent"):
@@ -1014,7 +1087,12 @@ def add_torrent_file(chat_id, user_id, document, source_message_id):
         Path(old["torrent_path"]).unlink(missing_ok=True)
     stored = INCOMING_DIR / f"{user_id}-{uuid.uuid4().hex}.torrent"
     stored.write_bytes(content)
-    PENDING[user_id] = {"torrent_path": str(stored), "filename": filename, "source_message_id": source_message_id}
+    PENDING[user_id] = {
+        "torrent_path": str(stored),
+        "filename": filename,
+        "source_message_id": source_message_id,
+        "media_title": media_title,
+    }
     return add_to_qbit(chat_id, user_id, "__auto__")
 
 
@@ -1024,7 +1102,12 @@ def add_to_qbit(chat_id, user_id, category):
         return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接或 .torrent 文件。", home_keyboard())
     before = {item["hash"] for item in task_list()}
     if "magnet" in pending:
-        add_data = {"urls": pending["magnet"], "tags": "islandbot", "autoTMM": "false", "paused": "true"}
+        add_data = {
+            "urls": pending["magnet"],
+            "tags": "islandbot",
+            "autoTMM": "false",
+            "stopCondition": "MetadataReceived",
+        }
         if category != "__auto__":
             add_data["category"] = category
         qbit("/api/v2/torrents/add", add_data)
@@ -1033,17 +1116,43 @@ def add_to_qbit(chat_id, user_id, category):
         if not source.exists():
             return send(chat_id, "种子文件已失效，请重新发送。", home_keyboard())
         qbit_add_torrent_file(pending["filename"], source.read_bytes(), category)
+    # qBittorrent needs a moment to register the new torrent.  It will stop at
+    # metadata, so no media payload is downloaded before we set file priority.
     time.sleep(1)
     added = [item for item in task_list() if item["hash"] not in before]
     if not added:
         return send(chat_id, "未能确认新任务，请在“我的任务”中检查。", home_keyboard())
+    new_task = max(added, key=lambda item: item.get("added_on", 0))
+    try:
+        plan = apply_moviepilot_dedupe(new_task["hash"], pending.get("media_title"))
+    except Exception as exc:
+        # Keep it stopped. Starting an unplanned task could re-download a
+        # whole season, which is worse than asking the user to retry.
+        qbit_action("pause", new_task["hash"])
+        return send(chat_id, f"⚠️ 未提交下载\n\n无法核对 MoviePilot 已入库记录：{str(exc)[:150]}\n任务已停止，不会下载。")
+
     PENDING.pop(user_id, None)
     if pending.get("torrent_path"):
         Path(pending["torrent_path"]).unlink(missing_ok=True)
-    new_task = max(added, key=lambda item: item.get("added_on", 0))
+
+    if plan["remaining"] == 0 and plan["total"]:
+        qbit("/api/v2/torrents/delete", {"hashes": new_task["hash"], "deleteFiles": "true"})
+        label = pending.get("media_title") or new_task.get("name", "该资源")
+        return send_temporary(
+            chat_id,
+            f"✅ 已跳过下载\n\n{label}\n共 {plan['total']} 个视频文件，均已由 MoviePilot 整理并上传。",
+            lifetime_seconds=15,
+        )
+
     QUEUE.append(new_task["hash"])
     save_queue()
     run_queue()
+    if plan["skipped"]:
+        send_temporary(
+            chat_id,
+            f"✅ 已跳过已入库：{plan['skipped']} 个\n将下载缺少的 {plan['remaining']} 个视频文件。",
+            lifetime_seconds=15,
+        )
     # Keep private magnets and torrent files out of chat history once selected.
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": pending["source_message_id"]})
@@ -1166,7 +1275,15 @@ def handle(update):
     chat_id = message["chat"]["id"]
     document = message.get("document")
     if document:
-        return add_torrent_file(chat_id, OWNER, document, message["message_id"])
+        # A .torrent can carry its media title in the Telegram caption.  Keep
+        # that explicit metadata for MoviePilot-history deduplication.
+        return add_torrent_file(
+            chat_id,
+            OWNER,
+            document,
+            message["message_id"],
+            extract_post_title(message.get("caption", "")),
+        )
     text = message.get("text", "").strip()
     title_pending = QUARK_TITLE_PENDING.get(str(chat_id))
     if title_pending:
@@ -1186,8 +1303,15 @@ def handle(update):
     quark_share = extract_quark_share(text)
     if quark_share:
         return add_quark_share(chat_id, quark_share, message["message_id"], extract_post_title(text))
-    if text.startswith("magnet:?xt=urn:btih:"):
-        return add_magnet(chat_id, OWNER, text, message["message_id"])
+    magnet = extract_magnet(text)
+    if magnet:
+        return add_magnet(
+            chat_id,
+            OWNER,
+            magnet,
+            message["message_id"],
+            extract_post_title(text),
+        )
     if text in {"/start", "/menu"}:
         return home(chat_id, message["from"].get("first_name", ""))
     if text == "/help":
