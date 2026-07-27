@@ -282,6 +282,34 @@ def checked_media_query(title):
     )
 
 
+def identity_name(title):
+    """Reduce a release/post title to the words that identify the media."""
+    value = re.sub(r"\{tmdb-\d+\}", " ", title, flags=re.IGNORECASE)
+    value = re.sub(r"[（(]\d{4}[)）]", " ", value)
+    value = re.sub(r"第\s*[一二三四五六七八九十\d]+\s*季", " ", value)
+    value = re.sub(r"(?i)\bseason\s*\d+\b", " ", value)
+    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", value))
+    english = " ".join(re.findall(r"[a-z0-9]{3,}", value.lower()))
+    return chinese, english
+
+
+def media_identities_match(source, result):
+    """Reject a valid-looking TMDB result when its title is unrelated."""
+    source_cn, source_en = identity_name(source)
+    result_cn, result_en = identity_name(result)
+    if len(source_cn) >= 2:
+        return len(result_cn) >= 2 and (source_cn in result_cn or result_cn in source_cn)
+    source_words = set(source_en.split())
+    result_words = set(result_en.split())
+    return bool(source_words & result_words)
+
+
+def safe_confirmed_media_title(title):
+    """A confirmation card must never accept a one-character placeholder."""
+    chinese, english = identity_name(title)
+    return len(chinese) >= 2 or bool(english)
+
+
 def save_media_id_cache():
     temporary = MEDIA_ID_CACHE_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(MEDIA_ID_CACHE, ensure_ascii=False))
@@ -298,7 +326,10 @@ def moviepilot_media_title(title):
     original = checked_media_query(title)
     cached = MEDIA_ID_CACHE.get(original)
     if cached and cached.get("title") and cached.get("tmdb_id"):
-        return cached["title"]
+        if media_identities_match(original, cached["title"]):
+            return cached["title"]
+        MEDIA_ID_CACHE.pop(original, None)
+        save_media_id_cache()
     if not MOVIEPILOT_TOKEN:
         raise RuntimeError("MoviePilot API_TOKEN 尚未连接，未开始下载")
     query = urllib.parse.urlencode({"title": original, "token": MOVIEPILOT_TOKEN})
@@ -317,6 +348,11 @@ def moviepilot_media_title(title):
     if not tmdb_id or not name:
         raise RuntimeError(f"MoviePilot 未确认“{original}”的 TMDB 信息，未开始下载")
     canonical = media_folder_name(f"{name} ({year}) {{tmdb-{tmdb_id}}}" if year else f"{name} {{tmdb-{tmdb_id}}}")
+    if not media_identities_match(original, canonical):
+        raise RuntimeError(
+            f"MoviePilot 返回了不相关结果“{canonical}”，未开始下载。"
+            "请回复更准确的剧名和首播年份。"
+        )
     MEDIA_ID_CACHE[original] = {"title": canonical, "tmdb_id": str(tmdb_id), "updated_at": time.time()}
     save_media_id_cache()
     return canonical
@@ -357,6 +393,13 @@ def request_quark_title(chat_id, share_url, folder_name, reason=None):
 
 def confirm_quark_download(chat_id, share_url, media_title):
     """Require one explicit identity confirmation before a large cloud download."""
+    if not safe_confirmed_media_title(media_title):
+        return request_quark_title(
+            chat_id,
+            share_url,
+            media_title,
+            "识别结果像占位符，已禁止下载",
+        )
     key = uuid.uuid4().hex[:10]
     QUARK_CONFIRM_PENDING[key] = {
         "url": share_url,
@@ -1462,6 +1505,13 @@ def handle_callback(callback):
         save_quark_confirm_pending()
         if not pending:
             return send(chat_id, "这个确认已过期，请重新发送分享链接。", home_keyboard())
+        if not safe_confirmed_media_title(pending["media_title"]):
+            return request_quark_title(
+                chat_id,
+                pending["url"],
+                pending["media_title"],
+                "旧识别结果无效，已禁止下载",
+            )
         return enqueue_quark_task(chat_id, pending["url"], pending["media_title"])
     if data.startswith("quarkedit:"):
         key = data.split(":", 1)[1]
