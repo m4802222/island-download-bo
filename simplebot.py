@@ -256,6 +256,26 @@ def media_folder_name(title):
     return name[:96]
 
 
+def checked_media_query(title):
+    """Return a safe title for automatic TMDB resolution, or stop safely.
+
+    Quark folder names are often release labels (or even one-character
+    placeholders such as ``G!``).  Sending those to a fuzzy TMDB search can
+    produce a perfectly valid, but completely unrelated, media item.  A
+    failed validation deliberately stops before any QAS/Aria2 task is made.
+    """
+    original = media_folder_name(title)
+    probe = re.sub(r"[（(]\d{4}[)）]", " ", original)
+    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", probe))
+    english_words = re.findall(r"[A-Za-z0-9]{3,}", probe)
+    if len(chinese) >= 2 or english_words:
+        return original
+    raise RuntimeError(
+        f"无法确认媒体标题“{original}”，未开始下载。\n"
+        "请发送包含剧名和年份的完整资源帖，或直接回复剧名，例如：龙之家族 (2022)"
+    )
+
+
 def save_media_id_cache():
     temporary = MEDIA_ID_CACHE_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(MEDIA_ID_CACHE, ensure_ascii=False))
@@ -269,7 +289,7 @@ def moviepilot_media_title(title):
     an instruction for MoviePilot, not a guessed title, so later Aria2 files
     remain recognisable even when their release names contain no show name.
     """
-    original = media_folder_name(title)
+    original = checked_media_query(title)
     cached = MEDIA_ID_CACHE.get(original)
     if cached and cached.get("title") and cached.get("tmdb_id"):
         return cached["title"]
