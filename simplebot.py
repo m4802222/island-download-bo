@@ -27,6 +27,8 @@ QAS_PASSWORD = os.environ.get("QAS_PASSWORD", "")
 QUARK_SAVE_PATH = os.environ.get("QUARK_SAVE_PATH", "/IslandDownloadBot")
 ARIA2_URL = os.environ.get("ARIA2_URL", "http://aria2:6800/jsonrpc")
 ARIA2_SECRET = os.environ.get("ARIA2_SECRET", "")
+MOVIEPILOT_URL = os.environ.get("MOVIEPILOT_URL", "http://moviepilot:3001").rstrip("/")
+MOVIEPILOT_TOKEN = os.environ.get("MOVIEPILOT_TOKEN", "").strip()
 COOKIE = ""
 OFFSET = 0
 PENDING = {}
@@ -60,6 +62,11 @@ ARIA2_FILE = DATA_DIR / "aria2.json"
 ARIA2_TRACKED = json.loads(ARIA2_FILE.read_text()) if ARIA2_FILE.exists() else {}
 HERMES_INBOX_FILE = DATA_DIR / "hermes_inbox.json"
 HERMES_INBOX_LOCK = threading.Lock()
+MEDIA_ID_CACHE_FILE = DATA_DIR / "media_id_cache.json"
+try:
+    MEDIA_ID_CACHE = json.loads(MEDIA_ID_CACHE_FILE.read_text()) if MEDIA_ID_CACHE_FILE.exists() else {}
+except (OSError, json.JSONDecodeError):
+    MEDIA_ID_CACHE = {}
 
 CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
 QUARK_URL_RE = re.compile(r"https?://pan\.quark\.cn/s/[A-Za-z0-9]+(?:\?[^\s]*)?", re.IGNORECASE)
@@ -249,6 +256,46 @@ def media_folder_name(title):
     return name[:96]
 
 
+def save_media_id_cache():
+    temporary = MEDIA_ID_CACHE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(MEDIA_ID_CACHE, ensure_ascii=False))
+    temporary.replace(MEDIA_ID_CACHE_FILE)
+
+
+def moviepilot_media_title(title):
+    """Resolve explicit post metadata through MoviePilot before any Quark download.
+
+    The returned folder deliberately includes TMDB's numeric identity.  It is
+    an instruction for MoviePilot, not a guessed title, so later Aria2 files
+    remain recognisable even when their release names contain no show name.
+    """
+    original = media_folder_name(title)
+    cached = MEDIA_ID_CACHE.get(original)
+    if cached and cached.get("title") and cached.get("tmdb_id"):
+        return cached["title"]
+    if not MOVIEPILOT_TOKEN:
+        raise RuntimeError("MoviePilot API_TOKEN 尚未连接，未开始下载")
+    query = urllib.parse.urlencode({"title": original, "token": MOVIEPILOT_TOKEN})
+    url = f"{MOVIEPILOT_URL}/api/v1/media/recognize2?{query}"
+    status, body, _ = request(url)
+    if status >= 300:
+        raise RuntimeError(f"MoviePilot 识别请求失败（HTTP {status}），未开始下载")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError("MoviePilot 识别返回异常，未开始下载")
+    media = payload.get("media_info") or {}
+    tmdb_id = media.get("tmdb_id")
+    name = media.get("title")
+    year = media.get("year") or media.get("release_year")
+    if not tmdb_id or not name:
+        raise RuntimeError(f"MoviePilot 未确认“{original}”的 TMDB 信息，未开始下载")
+    canonical = media_folder_name(f"{name} ({year}) {{tmdb-{tmdb_id}}}" if year else f"{name} {{tmdb-{tmdb_id}}}")
+    MEDIA_ID_CACHE[original] = {"title": canonical, "tmdb_id": str(tmdb_id), "updated_at": time.time()}
+    save_media_id_cache()
+    return canonical
+
+
 def folder_media_title(folder_name):
     """Return the original folder name only when it actually contains a title.
 
@@ -359,7 +406,8 @@ def moviepilot_existing(media_title):
     database = Path("/moviepilot-config/user.db")
     if not database.is_file():
         raise RuntimeError("MoviePilot 整理历史不可读取，已停止提交下载以防重复")
-    title = re.sub(r"\s*[（(]\d{4}[)）]\s*$", "", media_title).strip()
+    title = re.sub(r"\s*\{tmdb-\d+\}\s*$", "", media_title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[（(]\d{4}[)）]\s*$", "", title).strip()
     try:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
         rows = connection.execute(
@@ -504,7 +552,10 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
             base_url, folders, folder_title_hint = qas_download_choices(share_url)
             # The post title is explicit user-provided metadata and always wins
             # over a folder name, which can be malformed or release-only text.
-            title_hint = post_title or folder_title_hint
+            raw_title = post_title or folder_title_hint
+            # Never begin a cloud transfer from an unverified release name.
+            # MoviePilot provides the canonical Chinese title/year/TMDB ID.
+            title_hint = moviepilot_media_title(raw_title) if raw_title else None
             if len(folders) <= 1:
                 if not folders:
                     return enqueue_quark_task(chat_id, base_url, title_hint)
@@ -512,7 +563,10 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
                 selected_url = selected_share_url(base_url, folder)
                 # A title extracted from the forwarded post is explicit
                 # metadata; never replace it with a malformed Quark folder.
-                title = title_hint or folder_media_title(folder["name"])
+                title = title_hint
+                if not title:
+                    folder_title = folder_media_title(folder["name"])
+                    title = moviepilot_media_title(folder_title) if folder_title else None
                 if title:
                     return enqueue_quark_task(chat_id, selected_url, title)
                 return request_quark_title(chat_id, selected_url, folder["name"])
@@ -560,7 +614,8 @@ def process_hermes_inbox():
                     if state == "needs_title" and not title:
                         continue
                     base_url, folders, folder_title_hint = qas_download_choices(job["url"])
-                    title = title or folder_title_hint
+                    raw_title = title or folder_title_hint
+                    title = moviepilot_media_title(raw_title) if raw_title else None
                     selected_index = job.get("folder_index")
                     if len(folders) > 1 and selected_index is None:
                         job.update({
@@ -578,7 +633,9 @@ def process_hermes_inbox():
                             raise RuntimeError("文件夹选择无效")
                         folder = folders[selected_index]
                         selected_url = selected_share_url(base_url, folder)
-                        title = title or folder_media_title(folder["name"])
+                        if not title:
+                            folder_title = folder_media_title(folder["name"])
+                            title = moviepilot_media_title(folder_title) if folder_title else None
                     else:
                         selected_url = base_url
                     if not title:
@@ -1297,7 +1354,13 @@ def handle_callback(callback):
         except (ValueError, IndexError):
             return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
         selected_url = selected_share_url(pending["url"], folder)
-        title = pending.get("title_hint") or folder_media_title(folder["name"])
+        title = pending.get("title_hint")
+        if not title:
+            folder_title = folder_media_title(folder["name"])
+            try:
+                title = moviepilot_media_title(folder_title) if folder_title else None
+            except RuntimeError as exc:
+                return send(chat_id, str(exc), home_keyboard())
         if title:
             return enqueue_quark_task(chat_id, selected_url, title)
         return request_quark_title(chat_id, selected_url, folder["name"])
@@ -1373,7 +1436,7 @@ def handle(update):
             return send(chat_id, "已取消这次夸克下载。", home_keyboard())
         if text and not text.startswith("/") and not is_quark_share(text) and not text.startswith("magnet:"):
             try:
-                title = media_folder_name(text)
+                title = moviepilot_media_title(text)
             except RuntimeError as exc:
                 return send(chat_id, str(exc))
             QUARK_TITLE_PENDING.pop(str(chat_id), None)
