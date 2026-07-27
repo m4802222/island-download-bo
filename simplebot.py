@@ -278,7 +278,7 @@ def checked_media_query(title):
         return original
     raise RuntimeError(
         f"无法确认媒体标题“{original}”，未开始下载。\n"
-        "请发送包含剧名和年份的完整资源帖，或直接回复剧名，例如：龙之家族 (2022)"
+        "请发送完整资源帖，或直接回复剧名；年份可选，例如：龙之家族"
     )
 
 
@@ -387,7 +387,7 @@ def request_quark_title(chat_id, share_url, folder_name, reason=None):
     return send(
         chat_id,
         f"⚠️ 暂未开始下载\n\n已选择：{folder_name}{reason_line}\n"
-        "请直接回复正确剧名和首播年份，例如：\n光阴之外 (2025)\n\n输入 /cancel 可取消。",
+        "请直接回复正确剧名，年份可选，例如：\n光阴之外\n\n输入 /cancel 可取消。",
     )
 
 
