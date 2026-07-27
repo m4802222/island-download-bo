@@ -204,6 +204,18 @@ def extract_magnet(text):
     return match.group(0).rstrip(".,，。;；)") if match else None
 
 
+def message_text_with_links(message):
+    """Include Telegram text-link entities when the visible text hides a URL."""
+    text = (message.get("text") or message.get("caption") or "").strip()
+    urls = []
+    entities = message.get("entities") or message.get("caption_entities") or []
+    for entity in entities:
+        url = entity.get("url")
+        if url:
+            urls.append(url)
+    return "\n".join([text, *urls]).strip()
+
+
 def extract_post_title(text):
     """Read the title and year from a forwarded channel post.
 
@@ -255,7 +267,9 @@ def qas_open(path, payload=None, timeout=45):
 
 def media_folder_name(title):
     """Make a safe, human-readable parent folder for MoviePilot recognition."""
-    name = re.sub(r'[\\/:*?"<>|]+', " ", title).strip()
+    name = re.sub(r"^已更新\s*[：:]?\s*", "", title.strip())
+    name = re.sub(r"^(?:名称|片名|剧名)\s*[：:]\s*", "", name)
+    name = re.sub(r'[\\/:*?"<>|]+', " ", name).strip()
     name = re.sub(r"\s+", " ", name)
     if not name:
         raise RuntimeError("剧名不能为空")
@@ -376,18 +390,27 @@ def folder_media_title(folder_name):
     return None
 
 
-def request_quark_title(chat_id, share_url, folder_name, reason=None):
+def request_quark_title(chat_id, share_url, folder_name, reason=None, candidate=None):
+    candidate = media_folder_name(candidate) if candidate else None
     QUARK_TITLE_PENDING[str(chat_id)] = {
         "url": share_url,
         "folder": folder_name,
+        "candidate": candidate,
         "created_at": time.time(),
     }
     save_quark_title_pending()
     reason_line = f"\n原因：{reason}\n" if reason else ""
+    buttons = None
+    if candidate and safe_confirmed_media_title(candidate):
+        buttons = [
+            [{"text": f"使用“{candidate[:28]}”下载", "callback_data": "quarkusecandidate"}],
+            [{"text": "取消", "callback_data": "quarkcancelcandidate"}],
+        ]
     return send(
         chat_id,
         f"⚠️ 暂未开始下载\n\n已选择：{folder_name}{reason_line}\n"
         "请直接回复正确剧名，年份可选，例如：\n光阴之外\n\n输入 /cancel 可取消。",
+        buttons,
     )
 
 
@@ -699,7 +722,13 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
                 if not folders:
                     if title_hint:
                         return confirm_quark_download(chat_id, base_url, title_hint)
-                    return request_quark_title(chat_id, base_url, "分享根目录", title_error)
+                    return request_quark_title(
+                        chat_id,
+                        base_url,
+                        "分享根目录",
+                        title_error,
+                        raw_title,
+                    )
                 folder = folders[0]
                 selected_url = selected_share_url(base_url, folder)
                 # A title extracted from the forwarded post is explicit
@@ -714,13 +743,20 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
                             title_error = str(exc)
                 if title:
                     return confirm_quark_download(chat_id, selected_url, title)
-                return request_quark_title(chat_id, selected_url, folder["name"], title_error)
+                return request_quark_title(
+                    chat_id,
+                    selected_url,
+                    folder["name"],
+                    title_error,
+                    raw_title or folder_media_title(folder["name"]),
+                )
             key = uuid.uuid4().hex[:10]
             QUARK_PENDING[key] = {
                 "url": base_url,
                 "folders": folders,
                 "title_hint": title_hint,
                 "title_error": title_error,
+                "raw_title": raw_title,
                 "created_at": time.time(),
             }
             save_quark_pending()
@@ -1499,6 +1535,16 @@ def handle_callback(callback):
         return show_recent_completed(chat_id)
     if data == "home:server":
         return server_status(chat_id)
+    if data == "quarkusecandidate":
+        pending = QUARK_TITLE_PENDING.pop(str(chat_id), None)
+        save_quark_title_pending()
+        if not pending or not pending.get("candidate"):
+            return send(chat_id, "这个名称确认已过期，请重新发送分享链接。", home_keyboard())
+        return enqueue_quark_task(chat_id, pending["url"], pending["candidate"])
+    if data == "quarkcancelcandidate":
+        QUARK_TITLE_PENDING.pop(str(chat_id), None)
+        save_quark_title_pending()
+        return send(chat_id, "已取消这次夸克下载。", home_keyboard())
     if data.startswith("quarkconfirm:"):
         key = data.split(":", 1)[1]
         pending = QUARK_CONFIRM_PENDING.pop(key, None)
@@ -1542,7 +1588,13 @@ def handle_callback(callback):
             try:
                 title = moviepilot_media_title(folder_title) if folder_title else None
             except RuntimeError as exc:
-                return request_quark_title(chat_id, selected_url, folder["name"], str(exc))
+                return request_quark_title(
+                    chat_id,
+                    selected_url,
+                    folder["name"],
+                    str(exc),
+                    pending.get("raw_title") or folder_title,
+                )
         if title:
             return confirm_quark_download(chat_id, selected_url, title)
         return request_quark_title(
@@ -1550,6 +1602,7 @@ def handle_callback(callback):
             selected_url,
             folder["name"],
             pending.get("title_error"),
+            pending.get("raw_title"),
         )
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
@@ -1614,7 +1667,7 @@ def handle(update):
             message["message_id"],
             extract_post_title(message.get("caption", "")),
         )
-    text = message.get("text", "").strip()
+    text = message_text_with_links(message)
     title_pending = QUARK_TITLE_PENDING.get(str(chat_id))
     if title_pending:
         if text == "/cancel":
@@ -1651,6 +1704,15 @@ def handle(update):
         return server_status(chat_id)
     if any(word in text for word in ("任务", "队列", "下载进度")):
         return show_tasks(chat_id)
+    detected_title = extract_post_title(text)
+    if detected_title or any(marker in text for marker in ("投稿ID", "资源信息", "投稿来源")):
+        title_line = f"\n\n识别到标题：{detected_title}" if detected_title else ""
+        return send(
+            chat_id,
+            f"⚠️ 未检测到下载链接{title_line}\n\n"
+            "请发送包含夸克链接、magnet 链接的完整消息，或上传 .torrent 文件。",
+            home_keyboard(),
+        )
     send(chat_id, ai_reply(text))
 
 
