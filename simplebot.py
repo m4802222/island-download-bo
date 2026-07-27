@@ -56,6 +56,8 @@ QUARK_PENDING_FILE = DATA_DIR / "quark_pending.json"
 QUARK_PENDING = json.loads(QUARK_PENDING_FILE.read_text()) if QUARK_PENDING_FILE.exists() else {}
 QUARK_TITLE_PENDING_FILE = DATA_DIR / "quark_title_pending.json"
 QUARK_TITLE_PENDING = json.loads(QUARK_TITLE_PENDING_FILE.read_text()) if QUARK_TITLE_PENDING_FILE.exists() else {}
+QUARK_CONFIRM_PENDING_FILE = DATA_DIR / "quark_confirm_pending.json"
+QUARK_CONFIRM_PENDING = json.loads(QUARK_CONFIRM_PENDING_FILE.read_text()) if QUARK_CONFIRM_PENDING_FILE.exists() else {}
 QUARK_ACTIVE = False
 QUARK_LOCK = threading.Lock()
 ARIA2_FILE = DATA_DIR / "aria2.json"
@@ -122,6 +124,10 @@ def save_quark_pending():
 
 def save_quark_title_pending():
     QUARK_TITLE_PENDING_FILE.write_text(json.dumps(QUARK_TITLE_PENDING, ensure_ascii=False))
+
+
+def save_quark_confirm_pending():
+    QUARK_CONFIRM_PENDING_FILE.write_text(json.dumps(QUARK_CONFIRM_PENDING, ensure_ascii=False))
 
 
 def save_aria2_tracked():
@@ -334,14 +340,41 @@ def folder_media_title(folder_name):
     return None
 
 
-def request_quark_title(chat_id, share_url, folder_name):
+def request_quark_title(chat_id, share_url, folder_name, reason=None):
     QUARK_TITLE_PENDING[str(chat_id)] = {
         "url": share_url,
         "folder": folder_name,
         "created_at": time.time(),
     }
     save_quark_title_pending()
-    return send(chat_id, f"已选择：{folder_name}\n\n这个目录没有剧名。请输入剧名和年份，例如：\n鱿鱼游戏 (2021)\n\n输入 /cancel 可取消。")
+    reason_line = f"\n原因：{reason}\n" if reason else ""
+    return send(
+        chat_id,
+        f"⚠️ 暂未开始下载\n\n已选择：{folder_name}{reason_line}\n"
+        "请直接回复正确剧名和首播年份，例如：\n光阴之外 (2025)\n\n输入 /cancel 可取消。",
+    )
+
+
+def confirm_quark_download(chat_id, share_url, media_title):
+    """Require one explicit identity confirmation before a large cloud download."""
+    key = uuid.uuid4().hex[:10]
+    QUARK_CONFIRM_PENDING[key] = {
+        "url": share_url,
+        "media_title": media_title,
+        "created_at": time.time(),
+    }
+    save_quark_confirm_pending()
+    return send(
+        chat_id,
+        f"🎬 已确认媒体身份\n\n{media_title}\n\n系统将只下载 Google Drive 中缺少的集数。",
+        [
+            [{"text": "确认下载", "callback_data": f"quarkconfirm:{key}"}],
+            [
+                {"text": "修改剧名", "callback_data": f"quarkedit:{key}"},
+                {"text": "取消", "callback_data": f"quarkcancel:{key}"},
+            ],
+        ],
+    )
 
 
 def qas_task(share_url, task_name, media_title=None, pattern=""):
@@ -446,18 +479,55 @@ def moviepilot_existing(media_title):
     return episodes, bool(rows)
 
 
+def google_drive_existing(media_title):
+    """Read the real Google Drive library instead of trusting history alone."""
+    canonical = re.sub(r"\s*\{tmdb-\d+\}\s*$", "", media_title, flags=re.IGNORECASE).strip()
+    bare_title = re.sub(r"\s*[（(]\d{4}[)）]\s*$", "", canonical).strip()
+    try:
+        result = subprocess.run(
+            [
+                "rclone",
+                "--config",
+                "/rclone/rclone.conf",
+                "lsf",
+                "MP:Media",
+                "--recursive",
+                "--files-only",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Google Drive 媒体库读取失败，未提交下载：{exc}")
+    if result.returncode != 0:
+        raise RuntimeError(f"Google Drive 媒体库读取失败，未提交下载：{result.stderr.strip()[:120]}")
+    matched = []
+    for path in result.stdout.splitlines():
+        components = path.split("/")
+        if any(component == canonical or component.startswith(f"{bare_title} (") for component in components):
+            matched.append(path)
+    episodes = set()
+    for path in matched:
+        episodes.update(episode_keys(path))
+    return episodes, bool(matched)
+
+
 def quark_missing_plan(share_url, media_title):
-    """Build a QAS include regex for only the episodes absent from MoviePilot."""
+    """Build a QAS include regex using the actual Drive library as truth."""
     files = qas_share_video_files(share_url)
     if not files:
         return "", 0, 0
-    existing_episodes, has_history = moviepilot_existing(media_title)
+    history_episodes, has_history = moviepilot_existing(media_title)
+    drive_episodes, has_drive_media = google_drive_existing(media_title)
+    existing_episodes = history_episodes | drive_episodes
     episode_files = [(name, episode_key(name)) for name in files]
     if any(key for _, key in episode_files):
         missing = [name for name, key in episode_files if not key or key not in existing_episodes]
-    elif has_history:
-        # Movies do not have episode IDs. A successful record for the same
-        # title means the user already has that movie in this media library.
+    elif has_drive_media or has_history:
+        # Movies do not have episode IDs. A real Drive file or a successful
+        # transfer record for the same title means that movie already exists.
         missing = []
     else:
         missing = files
@@ -575,10 +645,18 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
             raw_title = post_title or folder_title_hint
             # Never begin a cloud transfer from an unverified release name.
             # MoviePilot provides the canonical Chinese title/year/TMDB ID.
-            title_hint = moviepilot_media_title(raw_title) if raw_title else None
+            title_hint = None
+            title_error = None
+            if raw_title:
+                try:
+                    title_hint = moviepilot_media_title(raw_title)
+                except RuntimeError as exc:
+                    title_error = str(exc)
             if len(folders) <= 1:
                 if not folders:
-                    return enqueue_quark_task(chat_id, base_url, title_hint)
+                    if title_hint:
+                        return confirm_quark_download(chat_id, base_url, title_hint)
+                    return request_quark_title(chat_id, base_url, "分享根目录", title_error)
                 folder = folders[0]
                 selected_url = selected_share_url(base_url, folder)
                 # A title extracted from the forwarded post is explicit
@@ -586,15 +664,20 @@ def add_quark_share(chat_id, share_url, source_message_id, post_title=None):
                 title = title_hint
                 if not title:
                     folder_title = folder_media_title(folder["name"])
-                    title = moviepilot_media_title(folder_title) if folder_title else None
+                    if folder_title:
+                        try:
+                            title = moviepilot_media_title(folder_title)
+                        except RuntimeError as exc:
+                            title_error = str(exc)
                 if title:
-                    return enqueue_quark_task(chat_id, selected_url, title)
-                return request_quark_title(chat_id, selected_url, folder["name"])
+                    return confirm_quark_download(chat_id, selected_url, title)
+                return request_quark_title(chat_id, selected_url, folder["name"], title_error)
             key = uuid.uuid4().hex[:10]
             QUARK_PENDING[key] = {
                 "url": base_url,
                 "folders": folders,
                 "title_hint": title_hint,
+                "title_error": title_error,
                 "created_at": time.time(),
             }
             save_quark_pending()
@@ -965,6 +1048,16 @@ def google_drive_capacity():
     except Exception as exc:
         print("google-drive-capacity error:", exc, flush=True)
         return "暂时无法读取"
+
+
+def moviepilot_transfer_now():
+    """Ask MoviePilot to scan completed external downloads immediately."""
+    if not MOVIEPILOT_TOKEN:
+        raise RuntimeError("MoviePilot API_TOKEN 尚未连接")
+    query = urllib.parse.urlencode({"token": MOVIEPILOT_TOKEN})
+    status, body, _ = request(f"{MOVIEPILOT_URL}/api/v1/transfer/now?{query}")
+    if status >= 300:
+        raise RuntimeError(f"MoviePilot 立即整理失败（HTTP {status}）：{body[:100]}")
 
 
 def run_queue():
@@ -1363,6 +1456,25 @@ def handle_callback(callback):
         return show_recent_completed(chat_id)
     if data == "home:server":
         return server_status(chat_id)
+    if data.startswith("quarkconfirm:"):
+        key = data.split(":", 1)[1]
+        pending = QUARK_CONFIRM_PENDING.pop(key, None)
+        save_quark_confirm_pending()
+        if not pending:
+            return send(chat_id, "这个确认已过期，请重新发送分享链接。", home_keyboard())
+        return enqueue_quark_task(chat_id, pending["url"], pending["media_title"])
+    if data.startswith("quarkedit:"):
+        key = data.split(":", 1)[1]
+        pending = QUARK_CONFIRM_PENDING.pop(key, None)
+        save_quark_confirm_pending()
+        if not pending:
+            return send(chat_id, "这个确认已过期，请重新发送分享链接。", home_keyboard())
+        return request_quark_title(chat_id, pending["url"], pending["media_title"], "请修正媒体身份")
+    if data.startswith("quarkcancel:"):
+        key = data.split(":", 1)[1]
+        QUARK_CONFIRM_PENDING.pop(key, None)
+        save_quark_confirm_pending()
+        return send(chat_id, "已取消这次夸克下载。", home_keyboard())
     if data.startswith("quarkselect:"):
         _, key, index_text = data.split(":", 2)
         pending = QUARK_PENDING.pop(key, None)
@@ -1380,10 +1492,15 @@ def handle_callback(callback):
             try:
                 title = moviepilot_media_title(folder_title) if folder_title else None
             except RuntimeError as exc:
-                return send(chat_id, str(exc), home_keyboard())
+                return request_quark_title(chat_id, selected_url, folder["name"], str(exc))
         if title:
-            return enqueue_quark_task(chat_id, selected_url, title)
-        return request_quark_title(chat_id, selected_url, folder["name"])
+            return confirm_quark_download(chat_id, selected_url, title)
+        return request_quark_title(
+            chat_id,
+            selected_url,
+            folder["name"],
+            pending.get("title_error"),
+        )
     if data.startswith("category:"):
         return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
     if data.startswith("task:"):
@@ -1461,8 +1578,7 @@ def handle(update):
                 return send(chat_id, str(exc))
             QUARK_TITLE_PENDING.pop(str(chat_id), None)
             save_quark_title_pending()
-            enqueue_quark_task(chat_id, title_pending["url"], title)
-            return send_temporary(chat_id, f"已设置媒体：{title}\n开始夸克转存队列。", lifetime_seconds=12)
+            return confirm_quark_download(chat_id, title_pending["url"], title)
     quark_share = extract_quark_share(text)
     if quark_share:
         return add_quark_share(chat_id, quark_share, message["message_id"], extract_post_title(text))
@@ -1511,7 +1627,16 @@ def watch_aria2_completed():
         if status == "complete" and not tracked.get("notified"):
             tracked["notified"] = True
             changed = True
-            send_temporary(OWNER, f"✅ Aria2 下载完成\n\n{tracked.get('name', aria2_name(item))}\n\nMoviePilot 已开始识别、整理并上传 Google Drive。")
+            try:
+                moviepilot_transfer_now()
+                result_text = "已通知 MoviePilot 立即识别、整理并上传 Google Drive。"
+            except Exception as exc:
+                print("moviepilot-transfer-now error:", exc, flush=True)
+                result_text = "MoviePilot 立即整理调用失败；文件仍保留在完成目录，请检查整理记录。"
+            send_temporary(
+                OWNER,
+                f"✅ Aria2 下载完成\n\n{tracked.get('name', aria2_name(item))}\n\n{result_text}",
+            )
         elif status == "error":
             send(OWNER, f"⚠️ Aria2 下载失败\n\n{tracked.get('name', aria2_name(item))}\n{item.get('errorMessage') or '请在我的任务中检查。'}")
             ARIA2_TRACKED.pop(gid, None)
