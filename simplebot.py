@@ -389,7 +389,12 @@ def moviepilot_media_title(title):
         break
 
     if not canonical or not tmdb_id:
-        raise RuntimeError(f"MoviePilot 未确认“{original}”的 TMDB 信息，未开始下载")
+        attempted = "、".join(f"“{item}”" for item in queries)
+        raise RuntimeError(
+            f"MoviePilot 未确认“{original}”的 TMDB 信息，未开始下载。\n"
+            f"已自动查询：{attempted}\n"
+            "请回复 TMDB 编号或正确剧名。"
+        )
     MEDIA_ID_CACHE[original] = {"title": canonical, "tmdb_id": str(tmdb_id), "updated_at": time.time()}
     save_media_id_cache()
     return canonical
