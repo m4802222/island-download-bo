@@ -346,27 +346,50 @@ def moviepilot_media_title(title):
         save_media_id_cache()
     if not MOVIEPILOT_TOKEN:
         raise RuntimeError("MoviePilot API_TOKEN 尚未连接，未开始下载")
-    query = urllib.parse.urlencode({"title": original, "token": MOVIEPILOT_TOKEN})
-    url = f"{MOVIEPILOT_URL}/api/v1/media/recognize2?{query}"
-    status, body, _ = request(url)
-    if status >= 300:
-        raise RuntimeError(f"MoviePilot 识别请求失败（HTTP {status}），未开始下载")
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        raise RuntimeError("MoviePilot 识别返回异常，未开始下载")
-    media = payload.get("media_info") or {}
-    tmdb_id = media.get("tmdb_id")
-    name = media.get("title")
-    year = media.get("year") or media.get("release_year")
-    if not tmdb_id or not name:
-        raise RuntimeError(f"MoviePilot 未确认“{original}”的 TMDB 信息，未开始下载")
-    canonical = media_folder_name(f"{name} ({year}) {{tmdb-{tmdb_id}}}" if year else f"{name} {{tmdb-{tmdb_id}}}")
-    if not media_identities_match(original, canonical):
-        raise RuntimeError(
-            f"MoviePilot 返回了不相关结果“{canonical}”，未开始下载。"
-            "请回复更准确的剧名和首播年份。"
+    requested_year_match = re.search(r"[（(](\d{4})[)）]", original)
+    requested_year = requested_year_match.group(1) if requested_year_match else None
+    yearless = re.sub(r"\s*[（(]\d{4}[)）]\s*", " ", original).strip()
+    queries = [original]
+    if yearless and yearless != original:
+        queries.append(yearless)
+
+    canonical = None
+    tmdb_id = None
+    for query_title in queries:
+        query = urllib.parse.urlencode(
+            {"title": query_title, "token": MOVIEPILOT_TOKEN}
         )
+        url = f"{MOVIEPILOT_URL}/api/v1/media/recognize2?{query}"
+        status, body, _ = request(url)
+        if status >= 300:
+            raise RuntimeError(
+                f"MoviePilot 识别请求失败（HTTP {status}），未开始下载"
+            )
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError("MoviePilot 识别返回异常，未开始下载")
+        media = payload.get("media_info") or {}
+        candidate_id = media.get("tmdb_id")
+        name = media.get("title")
+        year = media.get("year") or media.get("release_year")
+        if not candidate_id or not name:
+            continue
+        candidate = media_folder_name(
+            f"{name} ({year}) {{tmdb-{candidate_id}}}"
+            if year
+            else f"{name} {{tmdb-{candidate_id}}}"
+        )
+        if not media_identities_match(original, candidate):
+            continue
+        if requested_year and year and str(year) != requested_year:
+            continue
+        canonical = candidate
+        tmdb_id = candidate_id
+        break
+
+    if not canonical or not tmdb_id:
+        raise RuntimeError(f"MoviePilot 未确认“{original}”的 TMDB 信息，未开始下载")
     MEDIA_ID_CACHE[original] = {"title": canonical, "tmdb_id": str(tmdb_id), "updated_at": time.time()}
     save_media_id_cache()
     return canonical
@@ -1813,7 +1836,20 @@ def handle(update):
             QUARK_TITLE_PENDING.pop(str(chat_id), None)
             save_quark_title_pending()
             return send(chat_id, "已取消这次夸克下载。", home_keyboard())
-        if text and not text.startswith("/") and not is_quark_share(text) and not text.startswith("magnet:"):
+        # Re-forwarding a complete resource post while a title is pending must
+        # restart normal post parsing.  Do not feed its description and links
+        # to MoviePilot as though the whole message were a title.
+        repeated_quark_share = extract_quark_share(text)
+        if repeated_quark_share:
+            QUARK_TITLE_PENDING.pop(str(chat_id), None)
+            save_quark_title_pending()
+            return add_quark_share(
+                chat_id,
+                repeated_quark_share,
+                message["message_id"],
+                extract_post_title(text),
+            )
+        if text and not text.startswith("/") and not text.startswith("magnet:"):
             try:
                 title = resolve_pending_media_text(text, title_pending)
             except RuntimeError as exc:
