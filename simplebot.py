@@ -1765,18 +1765,42 @@ def handle_callback(callback):
         return send(chat_id, "已取消这次夸克下载。", home_keyboard())
     if data.startswith("quarkconfirm:"):
         key = data.split(":", 1)[1]
-        pending = QUARK_CONFIRM_PENDING.pop(key, None)
-        save_quark_confirm_pending()
+        pending = QUARK_CONFIRM_PENDING.get(key)
         if not pending:
             return send(chat_id, "这个确认已过期，请重新发送分享链接。", home_keyboard())
         if not safe_confirmed_media_title(pending["media_title"]):
+            QUARK_CONFIRM_PENDING.pop(key, None)
+            save_quark_confirm_pending()
             return request_quark_title(
                 chat_id,
                 pending["url"],
                 pending["media_title"],
                 "旧识别结果无效，已禁止下载",
             )
-        return enqueue_quark_task(chat_id, pending["url"], pending["media_title"])
+        try:
+            result = enqueue_quark_task(
+                chat_id,
+                pending["url"],
+                pending["media_title"],
+            )
+        except Exception as exc:
+            print("quark-confirm error:", exc, flush=True)
+            return send(
+                chat_id,
+                f"⚠️ 暂未开始下载\n\n{pending['media_title']}\n"
+                f"原因：{str(exc)[:180]}\n\n"
+                "确认记录已保留，可以直接重试，不会重复创建任务。",
+                [
+                    [{"text": "重试提交", "callback_data": f"quarkconfirm:{key}"}],
+                    [
+                        {"text": "修改剧名", "callback_data": f"quarkedit:{key}"},
+                        {"text": "取消", "callback_data": f"quarkcancel:{key}"},
+                    ],
+                ],
+            )
+        QUARK_CONFIRM_PENDING.pop(key, None)
+        save_quark_confirm_pending()
+        return result
     if data.startswith("quarkedit:"):
         key = data.split(":", 1)[1]
         pending = QUARK_CONFIRM_PENDING.pop(key, None)
@@ -1964,6 +1988,13 @@ def watch_aria2_completed():
         try:
             item = aria2_rpc("aria2.tellStatus", [gid, ["gid", "status", "errorMessage", "files"]])
         except Exception as exc:
+            # Aria2 eventually forgets old stopped/completed GIDs. Keeping
+            # those entries forever only produces HTTP 400 on every polling
+            # cycle and makes real task failures difficult to see.
+            if "HTTP 400" in str(exc):
+                ARIA2_TRACKED.pop(gid, None)
+                changed = True
+                continue
             print("aria2-watch error:", exc, flush=True)
             continue
         status = item.get("status")
@@ -1980,6 +2011,9 @@ def watch_aria2_completed():
                 OWNER,
                 f"✅ Aria2 下载完成\n\n{tracked.get('name', aria2_name(item))}\n\n{result_text}",
             )
+        elif status == "complete" and tracked.get("notified"):
+            ARIA2_TRACKED.pop(gid, None)
+            changed = True
         elif status == "error":
             send(OWNER, f"⚠️ Aria2 下载失败\n\n{tracked.get('name', aria2_name(item))}\n{item.get('errorMessage') or '请在我的任务中检查。'}")
             ARIA2_TRACKED.pop(gid, None)
