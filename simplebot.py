@@ -330,6 +330,54 @@ def save_media_id_cache():
     temporary.replace(MEDIA_ID_CACHE_FILE)
 
 
+def tmdb_web_media_title(title):
+    """Resolve an exact title from TMDB when MoviePilot's cache is behind.
+
+    Newly-added TMDB shows can be visible on TMDB before MoviePilot's
+    recognize endpoint indexes them.  Search TMDB's public result page, but
+    accept only a related title with the requested year.
+    """
+    original = checked_media_query(title)
+    requested_year_match = re.search(r"[（(](\d{4})[)）]", original)
+    requested_year = requested_year_match.group(1) if requested_year_match else None
+    yearless = re.sub(r"\s*[（(]\d{4}[)）]\s*", " ", original).strip()
+    for media_type in ("tv", "movie"):
+        query = urllib.parse.urlencode({"query": yearless, "language": "zh-CN"})
+        url = f"https://www.themoviedb.org/search/{media_type}?{query}"
+        try:
+            response = urllib.request.urlopen(
+                urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 IslandDownloadBot/1.0"},
+                ),
+                timeout=20,
+            )
+            page = response.read().decode("utf-8", errors="replace")
+        except (TimeoutError, socket.timeout, urllib.error.URLError):
+            continue
+        pattern = re.compile(
+            rf'href="/{media_type}/(\d+)[^"]*"[^>]*>.*?'
+            r'<h2[^>]*>.*?<span>(.*?)</span>.*?'
+            r'<span class="release_date[^"]*">(.*?)</span>',
+            re.DOTALL,
+        )
+        for tmdb_id, raw_name, raw_date in pattern.findall(page):
+            name = re.sub(r"<[^>]+>", "", raw_name).strip()
+            year_match = re.search(r"\b(\d{4})\b", raw_date)
+            year = year_match.group(1) if year_match else None
+            candidate = media_folder_name(
+                f"{name} ({year}) {{tmdb-{tmdb_id}}}"
+                if year
+                else f"{name} {{tmdb-{tmdb_id}}}"
+            )
+            if not media_identities_match(original, candidate):
+                continue
+            if requested_year and year and year != requested_year:
+                continue
+            return candidate, tmdb_id
+    return None, None
+
+
 def moviepilot_media_title(title):
     """Resolve explicit post metadata through MoviePilot before any Quark download.
 
@@ -387,6 +435,9 @@ def moviepilot_media_title(title):
         canonical = candidate
         tmdb_id = candidate_id
         break
+
+    if not canonical or not tmdb_id:
+        canonical, tmdb_id = tmdb_web_media_title(original)
 
     if not canonical or not tmdb_id:
         attempted = "、".join(f"“{item}”" for item in queries)
