@@ -372,6 +372,124 @@ def moviepilot_media_title(title):
     return canonical
 
 
+def moviepilot_tmdb_title(tmdb_id, preferred_title=None, forced_type=None):
+    """Resolve a user-supplied TMDB ID through MoviePilot.
+
+    TMDB movie and TV identifiers can overlap, so query both media types and
+    use the original post title to disambiguate.  If that is still ambiguous,
+    require the user to explicitly prefix the ID with 电影 or 电视剧.
+    """
+    tmdb_id = str(tmdb_id).strip()
+    if not re.fullmatch(r"\d{2,9}", tmdb_id):
+        raise RuntimeError("TMDB 编号格式不正确，请只发送数字，例如：85937")
+    if not MOVIEPILOT_TOKEN:
+        raise RuntimeError("MoviePilot API_TOKEN 尚未连接，未开始下载")
+
+    def remember(canonical):
+        # A manually supplied TMDB ID is authoritative.  Remember the mapping
+        # from the problematic post/folder title so a future identical share
+        # can go straight to the confirmation card.
+        if preferred_title and safe_confirmed_media_title(preferred_title):
+            cache_key = media_folder_name(preferred_title)
+            MEDIA_ID_CACHE[cache_key] = {
+                "title": canonical,
+                "tmdb_id": tmdb_id,
+                "updated_at": time.time(),
+                "source": "manual",
+            }
+            save_media_id_cache()
+        return canonical
+
+    type_names = [forced_type] if forced_type else ["电视剧", "电影"]
+    candidates = []
+    for type_name in type_names:
+        query = urllib.parse.urlencode(
+            {
+                "type_name": type_name,
+                "title": preferred_title or "",
+                "token": MOVIEPILOT_TOKEN,
+            }
+        )
+        status, body, _ = request(
+            f"{MOVIEPILOT_URL}/api/v1/media/tmdb:{tmdb_id}?{query}"
+        )
+        if status in {404, 422}:
+            continue
+        if status >= 300:
+            raise RuntimeError(
+                f"MoviePilot 查询 TMDB {tmdb_id} 失败（HTTP {status}），未开始下载"
+            )
+        try:
+            media = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(media, dict):
+            continue
+        returned_id = media.get("tmdb_id")
+        name = media.get("title")
+        if str(returned_id or "") != tmdb_id or not name:
+            continue
+        year = media.get("year") or media.get("release_year")
+        canonical = media_folder_name(
+            f"{name} ({year}) {{tmdb-{tmdb_id}}}"
+            if year
+            else f"{name} {{tmdb-{tmdb_id}}}"
+        )
+        candidates.append((type_name, canonical))
+
+    if not candidates:
+        raise RuntimeError(
+            f"MoviePilot 找不到 TMDB {tmdb_id}，请检查编号后重新发送"
+        )
+    if len(candidates) == 1:
+        return remember(candidates[0][1])
+
+    if preferred_title:
+        matched = [
+            canonical
+            for _, canonical in candidates
+            if media_identities_match(preferred_title, canonical)
+        ]
+        if len(matched) == 1:
+            return remember(matched[0])
+        tv_cues = re.search(
+            r"第\s*\d+\s*季|S\d{1,2}E\d{1,3}|电视剧|剧集|动漫|动画|完结|更新\s*\d+\s*集",
+            preferred_title,
+            re.IGNORECASE,
+        )
+        movie_cues = re.search(r"电影|影片", preferred_title)
+        if tv_cues and not movie_cues:
+            return remember(next(
+                canonical for type_name, canonical in candidates if type_name == "电视剧"
+            ))
+        if movie_cues and not tv_cues:
+            return remember(next(
+                canonical for type_name, canonical in candidates if type_name == "电影"
+            ))
+
+    raise RuntimeError(
+        f"TMDB {tmdb_id} 同时存在电影和电视剧结果。\n"
+        f"请回复“电视剧 {tmdb_id}”或“电影 {tmdb_id}”。"
+    )
+
+
+def resolve_pending_media_text(text, pending):
+    """Resolve either a title or a numeric TMDB ID from a pending reply."""
+    value = text.strip()
+    tmdb_match = re.fullmatch(
+        r"(?:(电影|电视剧)\s*)?(?:tmdb\s*[:：#-]?\s*)?(\d{2,9})",
+        value,
+        re.IGNORECASE,
+    )
+    if tmdb_match:
+        return moviepilot_tmdb_title(
+            tmdb_match.group(2),
+            pending.get("candidate") or pending.get("folder"),
+            tmdb_match.group(1),
+        )
+    return moviepilot_media_title(value)
+
+
 def folder_media_title(folder_name):
     """Return the original folder name only when it actually contains a title.
 
@@ -409,7 +527,9 @@ def request_quark_title(chat_id, share_url, folder_name, reason=None, candidate=
     return send(
         chat_id,
         f"⚠️ 暂未开始下载\n\n已选择：{folder_name}{reason_line}\n"
-        "请直接回复正确剧名，年份可选，例如：\n光阴之外\n\n输入 /cancel 可取消。",
+        "请回复 TMDB 编号，例如：85937\n"
+        "也可以回复正确剧名，年份可选，例如：光阴之外\n\n"
+        "输入 /cancel 可取消。",
         buttons,
     )
 
@@ -430,9 +550,23 @@ def confirm_quark_download(chat_id, share_url, media_title):
         "created_at": time.time(),
     }
     save_quark_confirm_pending()
+    identity = re.fullmatch(
+        r"(.+?)(?:\s+\((\d{4})\))?\s+\{tmdb-(\d+)\}",
+        media_title,
+        re.IGNORECASE,
+    )
+    if identity:
+        identity_text = (
+            f"名称：{identity.group(1)}\n"
+            f"年份：{identity.group(2) or '—'}\n"
+            f"TMDB：{identity.group(3)}"
+        )
+    else:
+        identity_text = media_title
     return send(
         chat_id,
-        f"🎬 已确认媒体身份\n\n{media_title}\n\n系统将只下载 Google Drive 中缺少的集数。",
+        f"🎬 已确认媒体身份\n\n{identity_text}\n\n"
+        "确认无误后才会创建下载任务；系统将跳过 Google Drive 中已有的集数。",
         [
             [{"text": "确认下载", "callback_data": f"quarkconfirm:{key}"}],
             [
@@ -1536,11 +1670,16 @@ def handle_callback(callback):
     if data == "home:server":
         return server_status(chat_id)
     if data == "quarkusecandidate":
-        pending = QUARK_TITLE_PENDING.pop(str(chat_id), None)
-        save_quark_title_pending()
+        pending = QUARK_TITLE_PENDING.get(str(chat_id))
         if not pending or not pending.get("candidate"):
             return send(chat_id, "这个名称确认已过期，请重新发送分享链接。", home_keyboard())
-        return enqueue_quark_task(chat_id, pending["url"], pending["candidate"])
+        try:
+            title = moviepilot_media_title(pending["candidate"])
+        except RuntimeError as exc:
+            return send(chat_id, str(exc))
+        QUARK_TITLE_PENDING.pop(str(chat_id), None)
+        save_quark_title_pending()
+        return confirm_quark_download(chat_id, pending["url"], title)
     if data == "quarkcancelcandidate":
         QUARK_TITLE_PENDING.pop(str(chat_id), None)
         save_quark_title_pending()
@@ -1676,7 +1815,7 @@ def handle(update):
             return send(chat_id, "已取消这次夸克下载。", home_keyboard())
         if text and not text.startswith("/") and not is_quark_share(text) and not text.startswith("magnet:"):
             try:
-                title = moviepilot_media_title(text)
+                title = resolve_pending_media_text(text, title_pending)
             except RuntimeError as exc:
                 return send(chat_id, str(exc))
             QUARK_TITLE_PENDING.pop(str(chat_id), None)
