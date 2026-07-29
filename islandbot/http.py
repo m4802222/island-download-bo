@@ -44,9 +44,12 @@ def fetch(
         body = json.dumps(json_body, ensure_ascii=False).encode()
         request_headers.setdefault("Content-Type", "application/json")
     request = urllib.request.Request(url, body, request_headers)
-    client = opener or urllib.request
     try:
-        response = client.open(request, timeout=timeout)
+        response = (
+            opener.open(request, timeout=timeout)
+            if opener is not None
+            else urllib.request.urlopen(request, timeout=timeout)
+        )
         return Response(response.status, response.read(), response.headers)
     except urllib.error.HTTPError as exc:
         return Response(exc.code, exc.read(), exc.headers)
