@@ -2,10 +2,22 @@ import os
 import unittest
 from unittest.mock import patch
 
-from islandbot.config import Settings
+from islandbot.config import Settings, explicit_web_port
 
 
 class SettingsTests(unittest.TestCase):
+    def test_public_url_displays_default_https_port(self):
+        self.assertEqual(
+            explicit_web_port("https://emby.6668777.xyz"),
+            "https://emby.6668777.xyz:443",
+        )
+
+    def test_public_url_keeps_explicit_port(self):
+        self.assertEqual(
+            explicit_web_port("http://207.58.173.248:8096"),
+            "http://207.58.173.248:8096",
+        )
+
     def test_required_values_and_limits_are_validated(self):
         environment = {
             "BOT_TOKEN": "token",

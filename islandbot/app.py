@@ -31,7 +31,7 @@ from .media import (
 )
 from .resolver import MediaResolver, ResolutionError
 from .storage import IdentityStore, JsonStore
-from .config import Settings
+from .config import Settings, explicit_web_port
 from .parsing import (
     extract_magnet,
     extract_post_title,
@@ -1524,7 +1524,7 @@ def handle(update):
         ACCOUNT_PENDING.pop(str(chat_id), None)
         save_account_pending()
         login = (
-            f"\n登录地址：{SETTINGS.emby_public_url}"
+            f"\n登录地址：{explicit_web_port(SETTINGS.emby_public_url)}"
             if SETTINGS.emby_public_url
             else ""
         )

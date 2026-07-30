@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,20 @@ def _integer(name: str, default: int, minimum: int = 1) -> int:
     if value < minimum:
         raise RuntimeError(f"{name} 不能小于 {minimum}")
     return value
+
+
+def explicit_web_port(url: str) -> str:
+    """Show the real public port even when HTTPS/HTTP uses its default."""
+    if not url:
+        return ""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.port is not None or parsed.scheme not in {"http", "https"}:
+        return url
+    port = 443 if parsed.scheme == "https" else 80
+    netloc = f"{parsed.hostname}:{port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 @dataclass(frozen=True)
