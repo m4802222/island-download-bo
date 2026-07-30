@@ -14,6 +14,7 @@ from pathlib import Path
 from . import __version__
 from .clients import (
     Aria2Client,
+    EmbyClient,
     MoviePilotClient,
     QasClient,
     QBitClient,
@@ -95,6 +96,9 @@ QUARK_LOCK = threading.Lock()
 ARIA2_FILE = DATA_DIR / "aria2.json"
 ARIA2_STORE = JsonStore(ARIA2_FILE, {})
 ARIA2_TRACKED = ARIA2_STORE.load()
+ACCOUNT_PENDING_FILE = DATA_DIR / "account_pending.json"
+ACCOUNT_PENDING_STORE = JsonStore(ACCOUNT_PENDING_FILE, {})
+ACCOUNT_PENDING = ACCOUNT_PENDING_STORE.load()
 HERMES_INBOX_FILE = DATA_DIR / "hermes_inbox.json"
 HERMES_INBOX_LOCK = threading.Lock()
 IDENTITIES = IdentityStore(DATA_DIR / "identities-v2.json")
@@ -108,6 +112,7 @@ TELEGRAM_CLIENT = TelegramClient(TOKEN)
 ARIA2_CLIENT = Aria2Client(ARIA2_URL, ARIA2_SECRET)
 QAS_CLIENT = QasClient(QAS_URL, QAS_USER, QAS_PASSWORD)
 QBIT_CLIENT = QBitClient(QBIT_URL, QBIT_USER, QBIT_PASSWORD)
+EMBY_CLIENT = EmbyClient(SETTINGS.emby_url, SETTINGS.emby_api_key)
 
 
 def request(url, data=None, headers=None):
@@ -167,6 +172,10 @@ def save_quark_confirm_pending():
 
 def save_aria2_tracked():
     ARIA2_STORE.save(ARIA2_TRACKED)
+
+
+def save_account_pending():
+    ACCOUNT_PENDING_STORE.save(ACCOUNT_PENDING)
 
 
 def hermes_jobs():
@@ -859,7 +868,7 @@ def answer(callback_id, text=None):
 
 def home_keyboard():
     return [
-        [{"text": "➕ 添加下载", "callback_data": "home:add"}, {"text": "📋 我的任务", "callback_data": "home:tasks"}],
+        [{"text": "👤 开号", "callback_data": "account:create"}, {"text": "📋 我的任务", "callback_data": "home:tasks"}],
         [{"text": "🖥 状态与设置", "callback_data": "home:server"}],
     ]
 
@@ -1329,8 +1338,18 @@ def handle_callback(callback):
     data = callback.get("data", "")
     if data == "home:home":
         return home(chat_id, callback["from"].get("first_name", ""))
-    if data == "home:add":
-        return send(chat_id, "请发送 magnet、夸克分享链接，或上传 .torrent 种子文件。\n系统会自动交给 MoviePilot 智能分类。", [[{"text": "返回主页", "callback_data": "home:home"}]])
+    if data == "account:create":
+        ACCOUNT_PENDING[str(chat_id)] = {"created_at": time.time()}
+        save_account_pending()
+        return send(
+            chat_id,
+            "请输入新账号的用户名。\n\n密码固定为 123456，仅有普通观看权限。\n输入 /cancel 可取消。",
+            [[{"text": "取消", "callback_data": "account:cancel"}]],
+        )
+    if data == "account:cancel":
+        ACCOUNT_PENDING.pop(str(chat_id), None)
+        save_account_pending()
+        return home(chat_id, callback["from"].get("first_name", ""))
     if data == "home:tasks":
         return show_tasks(chat_id)
     if data == "home:completed":
@@ -1487,6 +1506,37 @@ def handle(update):
     if not message or message.get("from", {}).get("id") != OWNER:
         return
     chat_id = message["chat"]["id"]
+    text = message_text_with_links(message)
+    if str(chat_id) in ACCOUNT_PENDING:
+        if text == "/cancel":
+            ACCOUNT_PENDING.pop(str(chat_id), None)
+            save_account_pending()
+            return send(chat_id, "已取消开号。", home_keyboard())
+        if not text or text.startswith("/"):
+            return send(chat_id, "请直接输入用户名，或输入 /cancel 取消。")
+        try:
+            account = EMBY_CLIENT.create_viewer(
+                text,
+                SETTINGS.emby_default_password,
+            )
+        except RuntimeError as exc:
+            return send(chat_id, f"开号失败：{exc}\n\n请换一个用户名重试，或输入 /cancel 取消。")
+        ACCOUNT_PENDING.pop(str(chat_id), None)
+        save_account_pending()
+        login = (
+            f"\n登录地址：{SETTINGS.emby_public_url}"
+            if SETTINGS.emby_public_url
+            else ""
+        )
+        return send(
+            chat_id,
+            f"✅ Emby 普通观看账号已创建\n\n"
+            f"用户名：{account['username']}\n"
+            f"密码：{SETTINGS.emby_default_password}"
+            f"{login}\n\n"
+            "已关闭管理、删除、下载、字幕管理和共享权限。",
+            home_keyboard(),
+        )
     document = message.get("document")
     if document:
         # A .torrent can carry its media title in the Telegram caption.  Keep
@@ -1498,7 +1548,6 @@ def handle(update):
             message["message_id"],
             extract_post_title(message.get("caption", "")),
         )
-    text = message_text_with_links(message)
     title_pending = QUARK_TITLE_PENDING.get(str(chat_id))
     if title_pending:
         if text == "/cancel":

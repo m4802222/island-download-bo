@@ -27,6 +27,117 @@ class TelegramClient:
         return payload
 
 
+class EmbyClient:
+    """Create owner-managed, playback-only Emby users."""
+
+    VIEWER_POLICY = {
+        "IsAdministrator": False,
+        "IsHidden": False,
+        "IsDisabled": False,
+        "EnableUserPreferenceAccess": False,
+        "EnableRemoteControlOfOtherUsers": False,
+        "EnableSharedDeviceControl": False,
+        "EnableRemoteAccess": True,
+        "EnableLiveTvManagement": False,
+        "EnableLiveTvAccess": False,
+        "EnableContentDeletion": False,
+        "EnableContentDeletionFromFolders": [],
+        "EnableContentDownloading": False,
+        "EnableSubtitleDownloading": False,
+        "EnableSubtitleManagement": False,
+        "EnableSyncTranscoding": False,
+        "EnableMediaConversion": False,
+        "EnableMediaPlayback": True,
+        "EnableAudioPlaybackTranscoding": True,
+        "EnableVideoPlaybackTranscoding": True,
+        "EnablePlaybackRemuxing": True,
+        "EnableAllDevices": True,
+        "EnableAllFolders": True,
+        "EnableAllChannels": False,
+        "EnablePublicSharing": False,
+        "AllowCameraUpload": False,
+        "AllowSharingPersonalItems": False,
+    }
+
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    def _request(
+        self,
+        path: str,
+        *,
+        method: str | None = None,
+        json_body: Any = None,
+        action: str,
+    ) -> Response:
+        if not self.api_key:
+            raise RuntimeError("Emby API 密钥尚未配置")
+        return require_ok(
+            fetch(
+                f"{self.base_url}/emby{path}",
+                method=method,
+                json_body=json_body,
+                headers={"X-Emby-Token": self.api_key, "Accept": "application/json"},
+                timeout=20,
+            ),
+            action,
+        )
+
+    def users(self) -> list[dict[str, Any]]:
+        payload = self._request("/Users", action="读取 Emby 用户").json()
+        return payload if isinstance(payload, list) else []
+
+    def create_viewer(self, username: str, password: str) -> dict[str, str]:
+        username = username.strip()
+        if not username or len(username) > 32:
+            raise RuntimeError("用户名长度必须为 1 到 32 个字符")
+        if any(character in username for character in "/\\\r\n\t"):
+            raise RuntimeError("用户名不能包含斜杠、反斜杠或换行")
+        if any(
+            str(user.get("Name", "")).casefold() == username.casefold()
+            for user in self.users()
+        ):
+            raise RuntimeError(f"Emby 用户“{username}”已存在")
+
+        created = self._request(
+            "/Users/New",
+            json_body={"Name": username},
+            action="创建 Emby 用户",
+        ).json()
+        user_id = str(created.get("Id") or "")
+        if not user_id:
+            raise RuntimeError("Emby 创建用户后没有返回用户 ID")
+
+        try:
+            self._request(
+                f"/Users/{urllib.parse.quote(user_id)}/Password",
+                json_body={
+                    "Id": user_id,
+                    "CurrentPw": "",
+                    "NewPw": password,
+                    "ResetPassword": False,
+                },
+                action="设置 Emby 密码",
+            )
+            policy = dict(created.get("Policy") or {})
+            policy.update(self.VIEWER_POLICY)
+            self._request(
+                f"/Users/{urllib.parse.quote(user_id)}/Policy",
+                json_body=policy,
+                action="设置 Emby 观看权限",
+            )
+        except Exception:
+            fetch(
+                f"{self.base_url}/emby/Users/{urllib.parse.quote(user_id)}",
+                method="DELETE",
+                headers={"X-Emby-Token": self.api_key},
+                timeout=20,
+            )
+            raise
+        return {"id": user_id, "username": username}
+
+
 class Aria2Client:
     def __init__(self, url: str, secret: str):
         self.url = url

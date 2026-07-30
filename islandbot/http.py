@@ -27,6 +27,7 @@ class Response:
 def fetch(
     url: str,
     *,
+    method: str | None = None,
     form: Mapping[str, Any] | None = None,
     json_body: Any = None,
     body: bytes | None = None,
@@ -43,7 +44,7 @@ def fetch(
     elif json_body is not None:
         body = json.dumps(json_body, ensure_ascii=False).encode()
         request_headers.setdefault("Content-Type", "application/json")
-    request = urllib.request.Request(url, body, request_headers)
+    request = urllib.request.Request(url, body, request_headers, method=method)
     try:
         response = (
             opener.open(request, timeout=timeout)

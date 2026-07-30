@@ -20,7 +20,9 @@ Google Drive 的媒体流程。
 
 - 磁力链接或 Telegram 上传的 `.torrent` 种子文件，分类后添加到 qBittorrent
 - 支持“智能分类”：不指定下载器分类，由 MoviePilot 按媒体元数据和现有规则整理
-- 极简主页：添加下载、任务、服务器状态、账户权限、帮助
+- 极简主页：Emby 开号、任务、服务器状态
+- 仅机器人所有者可用“开号”：输入用户名即创建普通观看账号，默认密码
+  `123456`，自动关闭管理、删除、下载、字幕管理和共享权限
 - 任务详情、暂停、继续、二次确认删除
 - 显示 qBittorrent 实时上传/下载速度和完成目录可用空间
 - 状态页显示 VPS 下载盘与 Google Drive 的实时总量、已用量、可用量
@@ -71,6 +73,9 @@ docker run -d --name island-download-bot --network media-net --restart unless-st
 `.env` 不应上传至 GitHub。
 
 如需夸克分享链接功能，额外填写 `QAS_URL`、`QAS_USERNAME`、`QAS_PASSWORD`。QAS 与机器人须位于同一个 Docker 网络。
+
+如需 Emby 开号功能，填写 `EMBY_API_KEY` 和 `EMBY_PUBLIC_URL`。API 密钥只保存在
+VPS 的 `.env` 中，不会显示在 Telegram 消息里。
 
 `MIN_FREE_GIB` 可调整下载目录的安全预留空间，默认值为 `10`。
 

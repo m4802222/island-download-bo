@@ -40,6 +40,10 @@ class Settings:
     aria2_secret: str
     moviepilot_url: str
     moviepilot_token: str
+    emby_url: str
+    emby_api_key: str
+    emby_public_url: str
+    emby_default_password: str
     ollama_url: str
     ollama_model: str
     data_dir: Path
@@ -66,6 +70,10 @@ class Settings:
             aria2_secret=os.environ.get("ARIA2_SECRET", "").strip(),
             moviepilot_url=os.environ.get("MOVIEPILOT_URL", "http://moviepilot:3001").rstrip("/"),
             moviepilot_token=os.environ.get("MOVIEPILOT_TOKEN", "").strip(),
+            emby_url=os.environ.get("EMBY_URL", "http://emby:8096").rstrip("/"),
+            emby_api_key=os.environ.get("EMBY_API_KEY", "").strip(),
+            emby_public_url=os.environ.get("EMBY_PUBLIC_URL", "").strip().rstrip("/"),
+            emby_default_password=os.environ.get("EMBY_DEFAULT_PASSWORD", "123456"),
             ollama_url=os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/"),
             ollama_model=os.environ.get("OLLAMA_MODEL", "qwen3:1.7b"),
             data_dir=Path(os.environ.get("DATA_DIR", "/data")),
