@@ -2,7 +2,7 @@
 set -euo pipefail
 
 interface=${TRAFFIC_INTERFACE:-ens5}
-threshold_bytes=${TRAFFIC_THRESHOLD_BYTES:-1800000000}
+threshold_bytes=${TRAFFIC_THRESHOLD_BYTES:-1800000000000}
 rate=${TRAFFIC_LIMIT_RATE:-8mbit}
 timezone=${TRAFFIC_BILLING_TIMEZONE:-Asia/Shanghai}
 
@@ -45,7 +45,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 IFACE = os.environ.get("TRAFFIC_INTERFACE", "ens5")
-THRESHOLD = int(os.environ.get("TRAFFIC_THRESHOLD_BYTES", "1800000000"))
+THRESHOLD = int(os.environ.get("TRAFFIC_THRESHOLD_BYTES", "1800000000000"))
 RATE = os.environ.get("TRAFFIC_LIMIT_RATE", "8mbit")
 TIMEZONE = os.environ.get("TRAFFIC_BILLING_TIMEZONE", "Asia/Shanghai")
 STATE_FILE = Path("/var/lib/traffic-guard/state.json")
