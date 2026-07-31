@@ -26,6 +26,18 @@ def _integer(name: str, default: int, minimum: int = 1) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} 必须是 true 或 false")
+
+
 def explicit_web_port(url: str) -> str:
     """Show the real public port even when HTTPS/HTTP uses its default."""
     if not url:
@@ -68,6 +80,8 @@ class Settings:
     drive_remote: str
     min_free_gib: int
     max_active_downloads: int
+    auto_cleanup_completed: bool
+    cleanup_interval_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -98,4 +112,6 @@ class Settings:
             drive_remote=os.environ.get("DRIVE_REMOTE", "MP:Media"),
             min_free_gib=_integer("MIN_FREE_GIB", 10),
             max_active_downloads=_integer("MAX_ACTIVE_DOWNLOADS", 2),
+            auto_cleanup_completed=_boolean("AUTO_CLEANUP_COMPLETED", True),
+            cleanup_interval_seconds=_integer("CLEANUP_INTERVAL_SECONDS", 60, 30),
         )

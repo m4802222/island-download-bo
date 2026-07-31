@@ -20,6 +20,7 @@ from .clients import (
     QBitClient,
     TelegramClient,
 )
+from .cleanup import safe_to_cleanup, successful_source_paths
 from .library import missing_plan
 from .media import (
     VIDEO_EXTENSIONS,
@@ -113,6 +114,7 @@ ARIA2_CLIENT = Aria2Client(ARIA2_URL, ARIA2_SECRET)
 QAS_CLIENT = QasClient(QAS_URL, QAS_USER, QAS_PASSWORD)
 QBIT_CLIENT = QBitClient(QBIT_URL, QBIT_USER, QBIT_PASSWORD)
 EMBY_CLIENT = EmbyClient(SETTINGS.emby_url, SETTINGS.emby_api_key)
+LAST_QBIT_CLEANUP = 0.0
 
 
 def request(url, data=None, headers=None):
@@ -1620,6 +1622,66 @@ def watch_completed():
     run_queue()
 
 
+def moviepilot_successful_sources():
+    """Return exactly the source files MoviePilot transferred successfully."""
+
+    database = SETTINGS.moviepilot_db
+    if not database.is_file():
+        raise RuntimeError("MoviePilot 整理历史不可读取")
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            rows = connection.execute(
+                "SELECT files, dest FROM transferhistory "
+                "WHERE status = 1 AND dest IS NOT NULL AND dest != ''"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"MoviePilot 整理历史读取失败：{exc}") from exc
+    return successful_source_paths(rows)
+
+
+def cleanup_transferred_qbit_tasks():
+    """Delete source data only after MoviePilot confirms every video file."""
+
+    global LAST_QBIT_CLEANUP
+    if not SETTINGS.auto_cleanup_completed:
+        return
+    now = time.monotonic()
+    if now - LAST_QBIT_CLEANUP < SETTINGS.cleanup_interval_seconds:
+        return
+    LAST_QBIT_CLEANUP = now
+
+    try:
+        sources = moviepilot_successful_sources()
+        tasks = QBIT_CLIENT.request("/api/v2/torrents/info").json()
+    except Exception as exc:
+        print(f"qbit-cleanup check failed: {exc}", flush=True)
+        return
+    removed = []
+    for task in tasks if isinstance(tasks, list) else []:
+        if float(task.get("progress") or 0) < 1:
+            continue
+        if task.get("state") not in {"stoppedUP", "missingFiles"}:
+            continue
+        task_hash = str(task.get("hash") or "")
+        if not task_hash:
+            continue
+        try:
+            files = QBIT_CLIENT.files(task_hash)
+            if not safe_to_cleanup(task, files, sources):
+                continue
+            QBIT_CLIENT.action("delete", task_hash, delete_files=True)
+            removed.append(str(task.get("name") or task_hash[:12]))
+        except Exception as exc:
+            print(f"qbit-cleanup task {task_hash[:12]} failed: {exc}", flush=True)
+
+    if removed:
+        print(
+            f"qbit-cleanup removed {len(removed)} transferred task(s): "
+            + " | ".join(removed),
+            flush=True,
+        )
+
+
 def watch_aria2_completed():
     changed = False
     for gid, tracked in list(ARIA2_TRACKED.items()):
@@ -1678,6 +1740,7 @@ def main():
             process_hermes_inbox()
             watch_completed()
             watch_aria2_completed()
+            cleanup_transferred_qbit_tasks()
             delete_expired_messages()
         except Exception as exc:
             print("error:", exc, flush=True)

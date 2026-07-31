@@ -32,6 +32,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.owner_id, 123)
         self.assertEqual(settings.min_free_gib, 5)
         self.assertEqual(settings.max_active_downloads, 3)
+        self.assertTrue(settings.auto_cleanup_completed)
+        self.assertEqual(settings.cleanup_interval_seconds, 60)
 
     def test_invalid_queue_limit_stops_startup(self):
         environment = {
@@ -43,6 +45,18 @@ class SettingsTests(unittest.TestCase):
         }
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, "不能小于"):
+                Settings.from_env()
+
+    def test_invalid_cleanup_switch_stops_startup(self):
+        environment = {
+            "BOT_TOKEN": "token",
+            "OWNER_ID": "123",
+            "QBIT_USERNAME": "admin",
+            "QBIT_PASSWORD": "secret",
+            "AUTO_CLEANUP_COMPLETED": "sometimes",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "true 或 false"):
                 Settings.from_env()
 
 
