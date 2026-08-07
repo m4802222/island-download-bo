@@ -6,6 +6,23 @@ from islandbot.http import Response
 
 
 class QBitClientTests(unittest.TestCase):
+    def test_torrent_file_uses_moviepilot_inbox(self):
+        client = QBitClient("http://qbit:8080", "admin", "secret")
+        client.cookie = "SID=test"
+        with patch(
+            "islandbot.clients.fetch",
+            return_value=Response(200, b"", {}),
+        ) as mocked:
+            client.add_torrent(
+                "show.torrent",
+                b"d4:infode",
+                "__auto__",
+                "/downloads/complete/islandbot",
+            )
+        body = mocked.call_args.kwargs["body"]
+        self.assertIn(b'name="savepath"', body)
+        self.assertIn(b"/downloads/complete/islandbot", body)
+
     def test_pause_uses_qbittorrent_v5_stop_endpoint(self):
         client = QBitClient("http://qbit:8080", "admin", "secret")
         client.cookie = "SID=test"

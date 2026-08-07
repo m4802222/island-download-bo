@@ -13,6 +13,18 @@ from collections.abc import Iterable
 from .media import VIDEO_EXTENSIONS
 
 
+def is_brush_task(task: dict) -> bool:
+    """Keep qBittorrent traffic-boosting tasks even after media transfer."""
+
+    category = str(task.get("category") or "").strip()
+    tags = {
+        tag.strip()
+        for tag in str(task.get("tags") or "").split(",")
+        if tag.strip()
+    }
+    return category.startswith("刷流") or any(tag.startswith("刷流") for tag in tags)
+
+
 def normalize_path(value: object) -> str:
     """Normalize a container path without resolving it on the host."""
 
@@ -70,9 +82,19 @@ def safe_to_cleanup(
 ) -> bool:
     """Require completion, an idle state, and exact MoviePilot confirmation."""
 
+    if is_brush_task(task):
+        return False
     if float(task.get("progress") or 0) < 1:
         return False
-    if task.get("state") not in {"stoppedUP", "missingFiles"}:
+    if task.get("state") not in {
+        "stoppedUP",
+        "pausedUP",
+        "queuedUP",
+        "stalledUP",
+        "uploading",
+        "forcedUP",
+        "missingFiles",
+    }:
         return False
     videos = selected_video_paths(task, files)
     return bool(videos) and videos.issubset(successful_sources)

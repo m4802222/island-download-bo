@@ -75,6 +75,7 @@ class Settings:
     ollama_model: str
     data_dir: Path
     downloads_dir: Path
+    qbit_save_path: str
     moviepilot_db: Path
     rclone_config: Path
     drive_remote: str
@@ -107,6 +108,9 @@ class Settings:
             ollama_model=os.environ.get("OLLAMA_MODEL", "qwen3:1.7b"),
             data_dir=Path(os.environ.get("DATA_DIR", "/data")),
             downloads_dir=Path(os.environ.get("DOWNLOADS_DIR", "/downloads")),
+            qbit_save_path=os.environ.get(
+                "QBIT_SAVE_PATH", "/downloads/complete/islandbot"
+            ).rstrip("/"),
             moviepilot_db=Path(os.environ.get("MOVIEPILOT_DB", "/moviepilot-config/user.db")),
             rclone_config=Path(os.environ.get("RCLONE_CONFIG", "/rclone/rclone.conf")),
             drive_remote=os.environ.get("DRIVE_REMOTE", "MP:Media"),

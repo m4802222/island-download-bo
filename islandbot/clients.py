@@ -303,7 +303,13 @@ class QBitClient:
         payload = self.request(f"/api/v2/torrents/files?{query}").json()
         return payload if isinstance(payload, list) else []
 
-    def add_torrent(self, filename: str, content: bytes, category: str) -> None:
+    def add_torrent(
+        self,
+        filename: str,
+        content: bytes,
+        category: str,
+        save_path: str,
+    ) -> None:
         boundary = f"----IslandDownload{uuid.uuid4().hex}"
         body = bytearray()
 
@@ -329,6 +335,7 @@ class QBitClient:
         field("tags", "islandbot")
         field("autoTMM", "false")
         field("stopCondition", "MetadataReceived")
+        field("savepath", save_path)
         if category != "__auto__":
             field("category", category)
         body.extend(f"--{boundary}--\r\n".encode())

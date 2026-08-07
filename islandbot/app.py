@@ -56,6 +56,7 @@ ARIA2_URL = SETTINGS.aria2_url
 ARIA2_SECRET = SETTINGS.aria2_secret
 MOVIEPILOT_URL = SETTINGS.moviepilot_url
 MOVIEPILOT_TOKEN = SETTINGS.moviepilot_token
+QBIT_SAVE_PATH = SETTINGS.qbit_save_path
 OFFSET = 0
 PENDING = {}
 
@@ -762,7 +763,12 @@ def qbit_action(action, hashes, delete_files=False):
 
 
 def qbit_add_torrent_file(filename, content, category):
-    return QBIT_CLIENT.add_torrent(filename, content, category)
+    return QBIT_CLIENT.add_torrent(
+        filename,
+        content,
+        category,
+        QBIT_SAVE_PATH,
+    )
 
 
 def qbit_files(torrent_hash):
@@ -1249,6 +1255,7 @@ def add_to_qbit(chat_id, user_id, category):
             "tags": "islandbot",
             "autoTMM": "false",
             "stopCondition": "MetadataReceived",
+            "savepath": QBIT_SAVE_PATH,
         }
         if category != "__auto__":
             add_data["category"] = category
@@ -1616,6 +1623,11 @@ def watch_completed():
     for item in task_list():
         if item.get("progress", 0) < 1 or item["hash"] in SEEN:
             continue
+        try:
+            moviepilot_transfer_now()
+        except Exception as exc:
+            print(f"moviepilot-transfer-now error: {exc}", flush=True)
+            continue
         SEEN.add(item["hash"])
         DONE_STORE.save(list(SEEN))
         send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '智能分类（MoviePilot）'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
@@ -1659,8 +1671,6 @@ def cleanup_transferred_qbit_tasks():
     removed = []
     for task in tasks if isinstance(tasks, list) else []:
         if float(task.get("progress") or 0) < 1:
-            continue
-        if task.get("state") not in {"stoppedUP", "missingFiles"}:
             continue
         task_hash = str(task.get("hash") or "")
         if not task_hash:

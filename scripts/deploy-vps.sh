@@ -55,7 +55,11 @@ if docker run -d \
     --restart unless-stopped \
     --env-file "$bot_dir/.env" \
     -e "ARIA2_SECRET=$RPC_SECRET" \
-    --volumes-from "$backup" \
+    -v /opt/media/downloadbot/data:/data:rw \
+    -v /opt/media/downloads:/downloads:ro \
+    -v /opt/media/downloads/aria2:/aria2-downloads:rw \
+    -v /opt/media/moviepilot/config:/moviepilot-config:ro \
+    -v /opt/media/moviepilot/config/rclone:/rclone:rw \
     "$image" >/dev/null; then
     sleep 5
 fi

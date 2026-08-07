@@ -32,6 +32,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.owner_id, 123)
         self.assertEqual(settings.min_free_gib, 5)
         self.assertEqual(settings.max_active_downloads, 3)
+        self.assertEqual(settings.qbit_save_path, "/downloads/complete/islandbot")
         self.assertTrue(settings.auto_cleanup_completed)
         self.assertEqual(settings.cleanup_interval_seconds, 60)
 
