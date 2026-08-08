@@ -183,41 +183,64 @@ class Aria2Client:
 
 
 class QasClient:
+    """QAS API client with cached login session.
+
+    The previous implementation logged in on every request.  This version
+    reuses the authenticated opener for up to 10 minutes and only creates
+    a new session when the old one is missing, expired, or rejected (401/403).
+    """
+
+    _SESSION_TTL = 600  # seconds before forcing a re-login
+
     def __init__(self, base_url: str, username: str, password: str):
         self.base_url = base_url
         self.username = username
         self.password = password
+        self._opener: urllib.request.OpenerDirector | None = None
+        self._opener_expiry: float = 0.0
+
+    def _login(self) -> None:
+        """Create a new authenticated session and cache the opener."""
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar)
+        )
+        login = fetch(
+            f"{self.base_url}/login",
+            form={"username": self.username, "password": self.password},
+            timeout=20,
+            opener=opener,
+        )
+        if login.status >= 300:
+            raise RuntimeError(f"QAS 登录失败（HTTP {login.status}）：{login.text[:80]}")
+        self._opener = opener
+        self._opener_expiry = time.time() + self._SESSION_TTL
 
     def request(self, path: str, payload: Any = None, timeout: int = 45) -> Response:
         if not self.username or not self.password:
             raise RuntimeError("夸克模块尚未配置 QAS 账号")
-        last_error = ""
-        for attempt in range(2):
-            jar = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor(jar)
-            )
-            login = fetch(
-                f"{self.base_url}/login",
-                form={"username": self.username, "password": self.password},
-                timeout=20,
-                opener=opener,
-            )
-            if login.status >= 300:
-                last_error = login.text
-                continue
+        # Re-login only when the cached session is missing or expired.
+        if self._opener is None or time.time() >= self._opener_expiry:
+            self._login()
+        response = fetch(
+            f"{self.base_url}{path}",
+            json_body=payload,
+            timeout=timeout,
+            opener=self._opener,
+        )
+        if response.status in {401, 403}:
+            # Session was rejected; log in once more and retry.
+            self._opener = None
+            self._login()
             response = fetch(
                 f"{self.base_url}{path}",
                 json_body=payload,
                 timeout=timeout,
-                opener=opener,
+                opener=self._opener,
             )
-            if response.status != 599:
-                return response
-            last_error = response.text
-            if attempt == 0:
-                time.sleep(2)
-        raise RuntimeError(f"夸克解析超时：{last_error[:120]}")
+        if response.status == 599:
+            raise RuntimeError(f"夸克解析超时：{response.text[:120]}")
+        return response
 
     def share_detail(self, share_url: str, stoken: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"shareurl": share_url}

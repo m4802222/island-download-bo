@@ -75,8 +75,17 @@ PENDING = {}
 DATA_DIR = SETTINGS.data_dir
 DATA_DIR.mkdir(exist_ok=True)
 DONE_FILE = DATA_DIR / "done.json"
-DONE_STORE = JsonStore(DONE_FILE, [])
-SEEN = set(DONE_STORE.load())
+DONE_STORE = JsonStore(DONE_FILE, {})
+# SEEN maps torrent-hash → unix timestamp of completion.
+# Old list format is migrated transparently on first load.
+_seen_raw = DONE_STORE.load()
+SEEN: dict[str, float] = (
+    {h: time.time() for h in _seen_raw if isinstance(h, str)}
+    if isinstance(_seen_raw, list)
+    else {h: float(t) for h, t in _seen_raw.items()
+          if isinstance(h, str) and isinstance(t, (int, float))}
+)
+del _seen_raw
 QUEUE_FILE = DATA_DIR / "queue.json"
 QUEUE_STORE = JsonStore(QUEUE_FILE, [])
 QUEUE = list(QUEUE_STORE.load())
@@ -108,6 +117,9 @@ QUARK_CONFIRM_PENDING_STORE = JsonStore(QUARK_CONFIRM_PENDING_FILE, {})
 QUARK_CONFIRM_PENDING = QUARK_CONFIRM_PENDING_STORE.load()
 QUARK_ACTIVE = False
 QUARK_LOCK = threading.Lock()
+# Protects QUEUE mutations that may occur from the Hermes background path
+# and the main polling loop at the same time.
+QUEUE_LOCK = threading.Lock()
 ARIA2_FILE = DATA_DIR / "aria2.json"
 ARIA2_STORE = JsonStore(ARIA2_FILE, {})
 ARIA2_TRACKED = ARIA2_STORE.load()
@@ -1364,8 +1376,9 @@ def add_to_qbit(chat_id, user_id, category):
             lifetime_seconds=15,
         )
 
-    QUEUE.append(new_task["hash"])
-    save_queue()
+    with QUEUE_LOCK:
+        QUEUE.append(new_task["hash"])
+        save_queue()
     run_queue()
     if plan["skipped"]:
         send_temporary(
@@ -1686,7 +1699,11 @@ def handle(update):
             "请发送包含夸克链接、magnet 链接的完整消息，或上传 .torrent 文件。",
             home_keyboard(),
         )
-    send(chat_id, ai_reply(text))
+    # Run in a background thread so Ollama latency (up to 15 s) never
+    # blocks the main polling loop from processing other Telegram messages.
+    def _send_ai_reply(cid=chat_id, question=text):
+        send(cid, ai_reply(question))
+    threading.Thread(target=_send_ai_reply, daemon=True).start()
 
 
 def watch_completed():
@@ -1703,9 +1720,11 @@ def watch_completed():
             moviepilot_transfer_now()
         except Exception as exc:
             print(f"moviepilot-transfer-now error: {exc}", flush=True)
+        # Purge completions older than 30 days to keep done.json compact.
+        _cutoff = time.time() - 30 * 24 * 60 * 60
         for item in newly_done:
-            SEEN.add(item["hash"])
-            DONE_STORE.save(list(SEEN))
+            SEEN[item["hash"]] = time.time()
+            DONE_STORE.save({h: t for h, t in SEEN.items() if t >= _cutoff})
             send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '智能分类（MoviePilot）'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
     run_queue()
 
