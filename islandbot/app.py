@@ -475,6 +475,10 @@ def google_drive_existing(media_title):
                 SETTINGS.drive_remote,
                 "--recursive",
                 "--files-only",
+                # Only scan subdirectories whose name starts with the exact title;
+                # avoids a full-drive recursive listing for every deduplication check.
+                "--include", f"**/{identity.title}/**",
+                "--include", f"**/{identity.title} (*/**",
             ],
             capture_output=True,
             text=True,
@@ -763,6 +767,7 @@ def ai_reply(question):
             "options": {"temperature": 0.2, "num_predict": 220},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": question}],
         },
+        timeout=15,
     )
     if status >= 300:
         print("ollama error:", body[:300], flush=True)
@@ -1327,8 +1332,14 @@ def add_to_qbit(chat_id, user_id, category):
         qbit_add_torrent_file(pending["filename"], source.read_bytes(), category)
     # qBittorrent needs a moment to register the new torrent.  It will stop at
     # metadata, so no media payload is downloaded before we set file priority.
-    time.sleep(1)
-    added = [item for item in task_list() if item["hash"] not in before]
+    # Poll up to 5 s instead of a fixed 1 s sleep so that fast registrations
+    # are detected immediately and slow ones don't silently fail.
+    added = []
+    for _ in range(10):
+        added = [item for item in task_list() if item["hash"] not in before]
+        if added:
+            break
+        time.sleep(0.5)
     if not added:
         return send(chat_id, "未能确认新任务，请在“我的任务”中检查。", home_keyboard())
     new_task = max(added, key=lambda item: item.get("added_on", 0))
@@ -1680,17 +1691,22 @@ def handle(update):
 
 def watch_completed():
     global SEEN
-    for item in task_list():
-        if item.get("progress", 0) < 1 or item["hash"] in SEEN:
-            continue
+    # Collect all newly completed tasks first, then trigger MoviePilot once.
+    # Previously each task triggered a separate transfer-now call, which was
+    # redundant because MoviePilot scans all completed downloads in one pass.
+    newly_done = [
+        item for item in task_list()
+        if item.get("progress", 0) >= 1 and item["hash"] not in SEEN
+    ]
+    if newly_done:
         try:
             moviepilot_transfer_now()
         except Exception as exc:
             print(f"moviepilot-transfer-now error: {exc}", flush=True)
-            continue
-        SEEN.add(item["hash"])
-        DONE_STORE.save(list(SEEN))
-        send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '智能分类（MoviePilot）'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
+        for item in newly_done:
+            SEEN.add(item["hash"])
+            DONE_STORE.save(list(SEEN))
+            send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '智能分类（MoviePilot）'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
     run_queue()
 
 
