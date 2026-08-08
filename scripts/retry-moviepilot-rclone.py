@@ -86,7 +86,55 @@ def run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     )
 
 
+def cleanup_stale_probes() -> None:
+    """Remove only old files created by this worker's write probes."""
+
+    result = run(
+        [
+            "docker",
+            "exec",
+            MOVIEPILOT_CONTAINER,
+            "rclone",
+            "delete",
+            "MP:/",
+            "--include",
+            ".islandbot-rclone-probe-*.txt",
+            "--max-depth",
+            "1",
+            "--min-age",
+            "1m",
+            "--retries",
+            "1",
+            "--low-level-retries",
+            "1",
+        ],
+        timeout=40,
+    )
+    if result.returncode != 0:
+        print("Deferred rclone probe cleanup is still unavailable", flush=True)
+
+
+def delete_probe(remote: str) -> bool:
+    result = run(
+        [
+            "docker",
+            "exec",
+            MOVIEPILOT_CONTAINER,
+            "rclone",
+            "deletefile",
+            remote,
+            "--retries",
+            "1",
+            "--low-level-retries",
+            "1",
+        ],
+        timeout=30,
+    )
+    return result.returncode == 0
+
+
 def probe_remote() -> tuple[str, str]:
+    cleanup_stale_probes()
     name = f".islandbot-rclone-probe-{os.getpid()}-{int(time.time())}.txt"
     remote = f"MP:/{name}"
     result = run(
@@ -112,19 +160,13 @@ def probe_remote() -> tuple[str, str]:
     output = (result.stdout + result.stderr).strip()
     status = classify_probe_error(output, result.returncode)
     if status == HEALTHY:
-        cleanup = run(
-            [
-                "docker",
-                "exec",
-                MOVIEPILOT_CONTAINER,
-                "rclone",
-                "deletefile",
-                remote,
-            ],
-            timeout=30,
-        )
-        if cleanup.returncode != 0:
-            print("rclone probe cleanup failed", flush=True)
+        for delay in (0, 3, 10, 30):
+            if delay:
+                time.sleep(delay)
+            if delete_probe(remote):
+                break
+        else:
+            print("rclone probe cleanup deferred until the next check", flush=True)
     return status, output[-1000:]
 
 
@@ -371,11 +413,6 @@ def main() -> None:
     parser.add_argument("--probe", action="store_true")
     args = parser.parse_args()
 
-    if args.probe:
-        status, output = probe_remote()
-        print(f"PROBE status={status} output={output[-500:].replace(chr(10), ' | ')}")
-        raise SystemExit(0 if status == HEALTHY else 1)
-
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     with LOCK_FILE.open("w") as lock:
         try:
@@ -383,6 +420,13 @@ def main() -> None:
         except BlockingIOError:
             print("Retry worker already running", flush=True)
             return
+        if args.probe:
+            status, output = probe_remote()
+            print(
+                f"PROBE status={status} "
+                f"output={output[-500:].replace(chr(10), ' | ')}"
+            )
+            raise SystemExit(0 if status == HEALTHY else 1)
         process(dry_run=args.dry_run)
 
 

@@ -4,7 +4,7 @@ set -euo pipefail
 bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
-ref=${ISLAND_BOT_REF:-v2.1.0}
+ref=${ISLAND_BOT_REF:-v2.1.1}
 archive_url="https://codeload.github.com/m4802222/island-download-bo/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
