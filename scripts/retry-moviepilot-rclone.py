@@ -34,6 +34,10 @@ from islandbot.retry import (  # noqa: E402
     pending_rclone_failures,
     update_retry_state,
 )
+from islandbot.transfer_verification import (  # noqa: E402
+    load_successful_transfer_proofs,
+    verified_transfer_sources,
+)
 
 PROBE_DELAYS = {
     HEALTHY: 5 * 60,
@@ -168,6 +172,78 @@ def probe_remote() -> tuple[str, str]:
         else:
             print("rclone probe cleanup deferred until the next check", flush=True)
     return status, output[-1000:]
+
+
+def remote_destination_size(destination: str) -> int | None:
+    """Read one live destination size through MoviePilot's MP remote."""
+
+    result = run(
+        [
+            "docker",
+            "exec",
+            MOVIEPILOT_CONTAINER,
+            "rclone",
+            "lsjson",
+            "--stat",
+            "--no-mimetype",
+            "--no-modtime",
+            f"MP:{destination}",
+            "--contimeout",
+            "10s",
+            "--timeout",
+            "20s",
+            "--retries",
+            "1",
+            "--low-level-retries",
+            "1",
+        ],
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        item = json.loads(result.stdout)
+        if not isinstance(item, dict) or item.get("IsDir") is not False:
+            return None
+        return int(item.get("Size"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def pending_failures():
+    """Return unresolved failures and the subset whose local source can retry."""
+
+    failures = pending_rclone_failures(
+        DATABASE,
+        source_exists=lambda _: True,
+        success_verified=lambda _: False,
+    )
+    if not failures:
+        return {}, set()
+    proofs = load_successful_transfer_proofs(DATABASE, set(failures))
+    proofs = {
+        source: proof
+        for source, proof in proofs.items()
+        if proof.history_id > failures[source].history_id
+    }
+    verified, _ = verified_transfer_sources(
+        proofs,
+        remote_destination_size,
+    )
+    unresolved = {}
+    retryable = set()
+    for source, failure in failures.items():
+        if source in verified:
+            continue
+        if source_exists(source):
+            unresolved[source] = failure
+            retryable.add(source)
+        elif source in proofs:
+            # MoviePilot move removed the source, but cloud proof has not yet
+            # passed. Keep downloads blocked without attempting a destructive
+            # redo that cannot succeed without the local source.
+            unresolved[source] = failure
+    return unresolved, retryable
 
 
 def redo(history_id: int) -> tuple[bool, str]:
@@ -309,7 +385,7 @@ def clear_block(block: dict, notification: str | None = None) -> None:
 
 def process(dry_run: bool = False) -> None:
     now = time.time()
-    failures = pending_rclone_failures(DATABASE, source_exists=source_exists)
+    failures, retryable = pending_failures()
     state = load_json(STATE_FILE)
     block = cloud_block_status(BLOCK_FILE)
 
@@ -355,6 +431,7 @@ def process(dry_run: bool = False) -> None:
         now,
         backend_status=status,
         allow_retry=status == HEALTHY,
+        retryable_sources=retryable,
     )
 
     already_paused = [str(item) for item in block.get("paused_hashes") or []]
@@ -385,6 +462,7 @@ def process(dry_run: bool = False) -> None:
         print(f"Upload backlog blocked: {STATUS_TEXT[status]}", flush=True)
         return
 
+    redo_succeeded = []
     for failure in due:
         success, message = redo(failure.history_id)
         attempts = int(state["items"][failure.source].get("attempts") or 0)
@@ -393,14 +471,25 @@ def process(dry_run: bool = False) -> None:
             flush=True,
         )
         if success:
-            notify(f"✅ 自动重试上传成功\n\n{failure.title}\nMoviePilot 记录 #{failure.history_id}")
+            redo_succeeded.append(failure)
         elif attempts in {1, 3, 6}:
             notify(
                 f"⚠️ 自动重试上传仍失败（第 {attempts} 次）\n\n"
                 f"{failure.title}\n原因：{message[:500]}"
             )
 
-    remaining = pending_rclone_failures(DATABASE, source_exists=source_exists)
+    remaining, _ = pending_failures()
+    for failure in redo_succeeded:
+        if failure.source not in remaining:
+            notify(
+                "✅ 自动重试上传成功并通过云盘校验\n\n"
+                f"{failure.title}\nMoviePilot 记录 #{failure.history_id}"
+            )
+        else:
+            print(
+                f"MoviePilot retry #{failure.history_id} awaiting remote verification",
+                flush=True,
+            )
     if not remaining:
         clear_block(cloud_block_status(BLOCK_FILE), "失败文件已重新上传成功。")
         state["items"] = {}

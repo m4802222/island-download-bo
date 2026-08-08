@@ -61,17 +61,27 @@ def successful_source_paths(rows: Iterable[tuple[object, object]]) -> set[str]:
 def selected_video_paths(task: dict, files: Iterable[dict]) -> set[str]:
     """Return selected video paths belonging to one qBittorrent task."""
 
+    return set(selected_video_sizes(task, files))
+
+
+def selected_video_sizes(task: dict, files: Iterable[dict]) -> dict[str, int]:
+    """Return selected qBittorrent video paths and their expected byte sizes."""
+
     save_path = normalize_path(task.get("save_path"))
     if not save_path:
-        return set()
-    paths: set[str] = set()
+        return {}
+    paths: dict[str, int] = {}
     for item in files:
         name = str(item.get("name") or "")
         if int(item.get("priority") or 0) <= 0:
             continue
         if not name.lower().endswith(VIDEO_EXTENSIONS):
             continue
-        paths.add(normalize_path(posixpath.join(save_path, name)))
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        paths[normalize_path(posixpath.join(save_path, name))] = size
     return paths
 
 

@@ -27,7 +27,7 @@ from .categories import (
     load_moviepilot_categories,
     qbit_category_paths,
 )
-from .cleanup import is_brush_task, safe_to_cleanup, successful_source_paths
+from .cleanup import is_brush_task, safe_to_cleanup, selected_video_sizes
 from .library import missing_plan
 from .media import (
     VIDEO_EXTENSIONS,
@@ -40,6 +40,10 @@ from .media import (
 from .resolver import MediaResolver, ResolutionError
 from .retry import cloud_block_status
 from .storage import IdentityStore, JsonStore
+from .transfer_verification import (
+    load_successful_transfer_proofs,
+    verified_transfer_sources,
+)
 from .config import Settings, explicit_web_port
 from .parsing import (
     extract_magnet,
@@ -1690,21 +1694,52 @@ def watch_completed():
     run_queue()
 
 
-def moviepilot_successful_sources():
-    """Return exactly the source files MoviePilot transferred successfully."""
+def moviepilot_successful_proofs(candidates):
+    """Return MoviePilot's latest successful source/destination metadata."""
 
-    database = SETTINGS.moviepilot_db
-    if not database.is_file():
-        raise RuntimeError("MoviePilot 整理历史不可读取")
+    return load_successful_transfer_proofs(
+        SETTINGS.moviepilot_db,
+        set(candidates),
+    )
+
+
+def rclone_destination_size(destination):
+    """Return the live byte size for one MoviePilot rclone destination."""
+
+    remote = SETTINGS.drive_remote.split(":", 1)[0] + ":"
     try:
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-            rows = connection.execute(
-                "SELECT files, dest FROM transferhistory "
-                "WHERE status = 1 AND dest IS NOT NULL AND dest != ''"
-            ).fetchall()
-    except sqlite3.Error as exc:
-        raise RuntimeError(f"MoviePilot 整理历史读取失败：{exc}") from exc
-    return successful_source_paths(rows)
+        result = subprocess.run(
+            [
+                "rclone",
+                "--config",
+                str(SETTINGS.rclone_config),
+                "lsjson",
+                "--stat",
+                "--no-mimetype",
+                "--no-modtime",
+                f"{remote}{destination}",
+                "--contimeout",
+                "10s",
+                "--timeout",
+                "20s",
+                "--retries",
+                "1",
+                "--low-level-retries",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        item = json.loads(result.stdout)
+        if not isinstance(item, dict) or item.get("IsDir") is not False:
+            return None
+        return int(item.get("Size"))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def cleanup_transferred_qbit_tasks():
@@ -1718,21 +1753,62 @@ def cleanup_transferred_qbit_tasks():
         return
     LAST_QBIT_CLEANUP = now
 
+    if cloud_block_status(CLOUD_UPLOAD_BLOCK_FILE).get("active"):
+        return
+
     try:
-        sources = moviepilot_successful_sources()
         tasks = QBIT_CLIENT.request("/api/v2/torrents/info").json()
     except Exception as exc:
         print(f"qbit-cleanup check failed: {exc}", flush=True)
         return
-    removed = []
+
+    candidates = []
+    expected_sizes = {}
+    task_files = {}
     for task in tasks if isinstance(tasks, list) else []:
-        if float(task.get("progress") or 0) < 1:
+        if float(task.get("progress") or 0) < 1 or is_brush_task(task):
             continue
         task_hash = str(task.get("hash") or "")
         if not task_hash:
             continue
         try:
             files = QBIT_CLIENT.files(task_hash)
+        except Exception as exc:
+            print(f"qbit-cleanup files {task_hash[:12]} failed: {exc}", flush=True)
+            continue
+        sizes = selected_video_sizes(task, files)
+        if not sizes or not safe_to_cleanup(task, files, set(sizes)):
+            continue
+        task_files[task_hash] = files
+        candidates.append(task)
+        expected_sizes.update(sizes)
+
+    if not candidates:
+        return
+    try:
+        proofs = moviepilot_successful_proofs(expected_sizes)
+        sources, rejected = verified_transfer_sources(
+            proofs,
+            rclone_destination_size,
+            expected_sizes,
+        )
+    except Exception as exc:
+        print(f"qbit-cleanup verification failed: {exc}", flush=True)
+        return
+
+    missing = set(expected_sizes) - set(proofs)
+    if missing or rejected:
+        print(
+            "qbit-cleanup retained unverified files: "
+            f"missing_history={len(missing)} rejected={len(rejected)}",
+            flush=True,
+        )
+
+    removed = []
+    for task in candidates:
+        task_hash = str(task.get("hash") or "")
+        try:
+            files = task_files[task_hash]
             if not safe_to_cleanup(task, files, sources):
                 continue
             QBIT_CLIENT.action("delete", task_hash, delete_files=True)

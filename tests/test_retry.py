@@ -84,6 +84,44 @@ class RcloneRetryTests(unittest.TestCase):
             )
             self.assertEqual(failures["/downloads/show.mkv"].history_id, 7)
 
+    def test_unverified_success_remains_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            database = self.make_database(root)
+            source = root / "show.mkv"
+            source.touch()
+            with sqlite3.connect(database) as connection:
+                connection.executemany(
+                    "INSERT INTO transferhistory VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        self.row(1, 0, "上传 rclone 失败", str(source)),
+                        self.row(2, 1, None, str(source)),
+                    ],
+                )
+            self.assertEqual(pending_rclone_failures(database), {})
+            failures = pending_rclone_failures(
+                database,
+                success_verified=lambda _: False,
+            )
+            self.assertEqual(failures[str(source)].history_id, 1)
+
+    def test_success_before_latest_failure_does_not_resolve_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            database = self.make_database(root)
+            source = root / "show.mkv"
+            source.touch()
+            with sqlite3.connect(database) as connection:
+                connection.executemany(
+                    "INSERT INTO transferhistory VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        self.row(1, 1, None, str(source)),
+                        self.row(2, 0, "上传 rclone 失败", str(source)),
+                    ],
+                )
+            failures = pending_rclone_failures(database)
+            self.assertEqual(failures[str(source)].history_id, 2)
+
     def test_probe_errors_are_classified(self):
         self.assertEqual(classify_probe_error("", 0), HEALTHY)
         self.assertEqual(
@@ -95,6 +133,7 @@ class RcloneRetryTests(unittest.TestCase):
         self.assertEqual(classify_probe_error("permission denied", 1), UNKNOWN)
 
     def test_first_failure_waits_then_backs_off(self):
+        self.assertEqual(RETRY_DELAYS[NETWORK][:4], (300, 900, 1800, 3600))
         failure = self.failure()
         failures = {failure.source: failure}
         due, state, new = update_retry_state(
@@ -132,6 +171,20 @@ class RcloneRetryTests(unittest.TestCase):
         )
         self.assertEqual(due, [])
         self.assertEqual(updated["items"][failure.source]["attempts"], 2)
+
+    def test_unretryable_source_stays_pending_without_attempt(self):
+        failure = self.failure()
+        due, state, new = update_retry_state(
+            {failure.source: failure},
+            {},
+            1000,
+            HEALTHY,
+            allow_retry=True,
+            retryable_sources=set(),
+        )
+        self.assertEqual(due, [])
+        self.assertEqual(new, [failure])
+        self.assertEqual(state["items"][failure.source]["attempts"], 0)
 
     def test_success_removes_persistent_items(self):
         state = {"items": {"old": {"attempts": 3}}, "backend": {"status": HEALTHY}}

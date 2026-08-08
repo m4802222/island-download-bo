@@ -17,7 +17,7 @@ UNKNOWN = "unknown"
 
 RETRY_DELAYS = {
     HEALTHY: (5 * 60, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 6 * 60 * 60),
-    NETWORK: (15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 6 * 60 * 60),
+    NETWORK: (5 * 60, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 6 * 60 * 60),
     QUOTA: (30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, 6 * 60 * 60),
     AUTH: (6 * 60 * 60,),
     UNKNOWN: (30 * 60, 60 * 60, 2 * 60 * 60, 6 * 60 * 60),
@@ -42,6 +42,7 @@ def _is_rclone_upload_error(error: object) -> bool:
 def pending_rclone_failures(
     database: Path,
     source_exists: Callable[[str], bool] | None = None,
+    success_verified: Callable[[str], bool] | None = None,
 ) -> dict[str, TransferFailure]:
     """Return the latest retryable upload failure for each existing source."""
 
@@ -51,16 +52,17 @@ def pending_rclone_failures(
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
             rows = connection.execute(
                 "SELECT failed.id, failed.src, failed.title, failed.errmsg, "
-                "failed.date, failed.download_hash "
+                "failed.date, failed.download_hash, EXISTS("
+                "SELECT 1 FROM transferhistory AS ok "
+                "WHERE ok.status = 1 AND ok.src = failed.src "
+                "AND ok.id > failed.id"
+                ") AS has_success "
                 "FROM transferhistory AS failed "
                 "WHERE failed.status = 0 AND failed.src IS NOT NULL "
                 "AND failed.src != '' "
                 "AND failed.id = ("
                 "SELECT MAX(latest.id) FROM transferhistory AS latest "
                 "WHERE latest.status = 0 AND latest.src = failed.src"
-                ") AND NOT EXISTS ("
-                "SELECT 1 FROM transferhistory AS ok "
-                "WHERE ok.status = 1 AND ok.src = failed.src"
                 ") ORDER BY failed.id",
             ).fetchall()
     except sqlite3.Error as exc:
@@ -68,9 +70,13 @@ def pending_rclone_failures(
 
     exists = source_exists or (lambda source: Path(source).is_file())
     failures: dict[str, TransferFailure] = {}
-    for history_id, source, title, error, date, download_hash in rows:
+    for history_id, source, title, error, date, download_hash, has_success in rows:
         source = str(source or "")
         if not _is_rclone_upload_error(error) or not exists(source):
+            continue
+        if has_success and (
+            success_verified is None or success_verified(source)
+        ):
             continue
         failures[source] = TransferFailure(
             history_id=int(history_id),
@@ -142,6 +148,7 @@ def update_retry_state(
     now: float,
     backend_status: str,
     allow_retry: bool,
+    retryable_sources: set[str] | None = None,
 ) -> tuple[list[TransferFailure], dict, list[TransferFailure]]:
     """Register failures, retain backoff, and return due and newly seen items."""
 
@@ -163,7 +170,8 @@ def update_retry_state(
             }
         attempts = max(0, int(item.get("attempts") or 0))
         item.update(asdict(failure))
-        if allow_retry and now >= float(item.get("next_retry") or 0):
+        retryable = retryable_sources is None or source in retryable_sources
+        if allow_retry and retryable and now >= float(item.get("next_retry") or 0):
             due.append(failure)
             attempts += 1
             item["attempts"] = attempts

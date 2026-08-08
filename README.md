@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.2.1`。
+当前稳定版本：`v2.3.0`。
 
 ## 2.0 重构重点
 
@@ -29,12 +29,12 @@ Google Drive 的媒体流程。
 - 显示 qBittorrent 实时上传/下载速度和完成目录可用空间
 - 状态页显示 VPS 下载盘与 Google Drive 的实时总量、已用量、可用量
 - 自动兼容 qBittorrent 5 的 HTTP 204 登录响应；会话过期自动重连，短暂网络失败自动重试
-- 下载完成后立即触发 MoviePilot，自动识别、命名并上传 Google Drive；只有成功整理记录精确覆盖全部视频后才删除普通任务和源文件，刷流任务始终保留
+- 下载完成后立即触发 MoviePilot，自动识别、命名并上传 Google Drive；只有 MoviePilot 成功记录、历史源/目标大小、云盘实时文件大小和 qB 文件大小全部一致后，才删除普通任务和源文件，刷流任务始终保留
 - 下载完成提示会在 5 分钟后自动清理，保持聊天简洁
 - 支持发送 `pan.quark.cn` 分享链接：QAS 转存后将文件直链交给 Aria2，完成后由 MoviePilot 入库 Google Drive
 - 普通中文消息接入本地 Ollama AI 助手；下载与删除仍须使用机器人操作确认
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
-- MoviePilot 的 rclone 上传失败时保留源文件、暂停普通下载并按错误类型退避重试；
+- MoviePilot 的 rclone 上传失败时保留源文件、暂停普通下载；网络错误按 5、15、30、60 分钟递增重试，OAuth 失效不进行高频重试；
   Google Drive 恢复后自动续传并恢复被系统暂停的任务，刷流任务始终不受影响
 - 分类名称直接读取 MoviePilot 的 `category.yaml` 并严格校验“华语 / 日韩 / 海外”
   九分类；qBittorrent 自动补齐对应分类和保存路径，无任务占用时移除旧“欧美”分类
@@ -72,14 +72,15 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.2.1/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.3.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
 部署脚本会先执行编译和测试，保留上一版源码用于失败回滚，并以目录方式将
 MoviePilot 的 rclone 配置挂载到 `/rclone:rw`，避免 OAuth 刷新后容器仍读取旧文件。
-部署完成后还会安装上传恢复定时器；它只重试源文件仍存在的 rclone 上传失败记录，
-不会重试识别失败、文件不存在或已经成功的历史记录。
+部署完成后还会安装上传恢复定时器；它只重试源文件仍存在的 rclone 上传失败记录。
+MoviePilot 已移动源文件时会继续阻止新普通下载，直到成功记录与云盘实时文件大小通过验证；
+不会把识别失败或旧成功记录误判为本次上传成功。
 
 同步某个 Google Drive 账号的 OAuth token 时，必须显式指定远程名称：
 
@@ -101,7 +102,7 @@ VPS 的 `.env` 中，不会显示在 Telegram 消息里。
 `MIN_FREE_GIB` 可调整下载目录的安全预留空间，默认值为 `10`。
 
 `QBIT_SAVE_PATH` 固定为 `/downloads/complete/islandbot`。`AUTO_CLEANUP_COMPLETED`
-开启后，仅在 MoviePilot 成功整理记录精确匹配全部视频文件时清理普通下载任务；
+开启后，仅在 MoviePilot 成功记录、历史大小、qB 文件大小和云盘实时大小四者一致时清理普通下载任务；
 刷流分类和刷流标签不会自动删除。
 
 ## 测试
