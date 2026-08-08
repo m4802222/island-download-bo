@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.0.1`。
+当前稳定版本：`v2.1.0`。
 
 ## 2.0 重构重点
 
@@ -34,6 +34,8 @@ Google Drive 的媒体流程。
 - 支持发送 `pan.quark.cn` 分享链接：QAS 转存后将文件直链交给 Aria2，完成后由 MoviePilot 入库 Google Drive
 - 普通中文消息接入本地 Ollama AI 助手；下载与删除仍须使用机器人操作确认
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
+- MoviePilot 的 rclone 上传失败时保留源文件、暂停普通下载并按错误类型退避重试；
+  Google Drive 恢复后自动续传并恢复被系统暂停的任务，刷流任务始终不受影响
 
 ## 夸克确认流程
 
@@ -64,12 +66,14 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.0.1/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.1.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
 部署脚本会先执行编译和测试，保留上一版源码用于失败回滚，并以目录方式将
 MoviePilot 的 rclone 配置挂载到 `/rclone:rw`，避免 OAuth 刷新后容器仍读取旧文件。
+部署完成后还会安装上传恢复定时器；它只重试源文件仍存在的 rclone 上传失败记录，
+不会重试识别失败、文件不存在或已经成功的历史记录。
 
 `.env` 不应上传至 GitHub。
 

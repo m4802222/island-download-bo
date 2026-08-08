@@ -20,7 +20,7 @@ from .clients import (
     QBitClient,
     TelegramClient,
 )
-from .cleanup import safe_to_cleanup, successful_source_paths
+from .cleanup import is_brush_task, safe_to_cleanup, successful_source_paths
 from .library import missing_plan
 from .media import (
     VIDEO_EXTENSIONS,
@@ -31,6 +31,7 @@ from .media import (
     season_number,
 )
 from .resolver import MediaResolver, ResolutionError
+from .retry import cloud_block_status
 from .storage import IdentityStore, JsonStore
 from .config import Settings, explicit_web_port
 from .parsing import (
@@ -69,6 +70,7 @@ QUEUE_FILE = DATA_DIR / "queue.json"
 QUEUE_STORE = JsonStore(QUEUE_FILE, [])
 QUEUE = list(QUEUE_STORE.load())
 QUEUE_READY = QUEUE_FILE.exists()
+CLOUD_UPLOAD_BLOCK_FILE = DATA_DIR / "cloud-upload-block.json"
 BLOCKED_FILE = DATA_DIR / "blocked.json"
 BLOCKED_STORE = JsonStore(BLOCKED_FILE, [])
 BLOCKED = set(BLOCKED_STORE.load())
@@ -559,7 +561,11 @@ def run_quark_queue():
     """Run one QAS transfer at a time; QAS then dispatches files to Aria2."""
     global QUARK_ACTIVE
     with QUARK_LOCK:
-        if QUARK_ACTIVE or not QUARK_QUEUE:
+        if (
+            QUARK_ACTIVE
+            or not QUARK_QUEUE
+            or cloud_block_status(CLOUD_UPLOAD_BLOCK_FILE).get("active")
+        ):
             return
         task = QUARK_QUEUE.pop(0)
         save_quark_queue()
@@ -977,6 +983,21 @@ def run_queue():
         BLOCKED.difference_update(stale_blocked)
         save_blocked()
     if not QUEUE:
+        return
+
+    # A retained MoviePilot upload failure must be cleared before ordinary
+    # downloads consume more disk. Brush tasks are always outside this gate.
+    cloud_block = cloud_block_status(CLOUD_UPLOAD_BLOCK_FILE)
+    if cloud_block.get("active"):
+        for task_hash in QUEUE:
+            item = task_by_hash.get(task_hash)
+            if (
+                item
+                and not is_brush_task(item)
+                and item.get("state")
+                not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}
+            ):
+                qbit_action("pause", task_hash)
         return
 
     active_hashes = QUEUE[:MAX_ACTIVE_DOWNLOADS]
@@ -1748,6 +1769,7 @@ def main():
             for update in updates.get("result", []):
                 handle(update)
             process_hermes_inbox()
+            run_quark_queue()
             watch_completed()
             watch_aria2_completed()
             cleanup_transferred_qbit_tasks()

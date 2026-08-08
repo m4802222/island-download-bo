@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry failed MoviePilot rclone transfers
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/media/downloadbot/scripts/retry-moviepilot-rclone.py
+TimeoutStartSec=25min
+Nice=10
