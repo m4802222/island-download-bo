@@ -120,6 +120,14 @@ QUARK_LOCK = threading.Lock()
 # Protects QUEUE mutations that may occur from the Hermes background path
 # and the main polling loop at the same time.
 QUEUE_LOCK = threading.Lock()
+# Protects EXPIRING list from concurrent access by the AI-reply daemon
+# thread (send_temporary) and the main loop (delete_expired_messages).
+EXPIRING_LOCK = threading.Lock()
+# Tracks when each queued task first appeared at 0% progress.
+# Used to detect stalled downloads that never started.
+STALL_FIRST_SEEN: dict[str, float] = {}
+STALL_THRESHOLD = 30 * 60  # seconds at 0% before auto-pause
+STALL_NOTIFIED: set[str] = set()
 ARIA2_FILE = DATA_DIR / "aria2.json"
 ARIA2_STORE = JsonStore(ARIA2_FILE, {})
 ARIA2_TRACKED = ARIA2_STORE.load()
@@ -909,14 +917,17 @@ def send_temporary(chat_id, text, lifetime_seconds=300):
     response = send(chat_id, text)
     message_id = response.get("result", {}).get("message_id")
     if message_id:
-        EXPIRING.append({"chat_id": chat_id, "message_id": message_id, "delete_at": time.time() + lifetime_seconds})
-        EXPIRY_STORE.save(EXPIRING)
+        with EXPIRING_LOCK:
+            EXPIRING.append({"chat_id": chat_id, "message_id": message_id, "delete_at": time.time() + lifetime_seconds})
+            EXPIRY_STORE.save(EXPIRING)
 
 
 def delete_expired_messages():
     now = time.time()
+    with EXPIRING_LOCK:
+        snapshot = list(EXPIRING)
     remaining = []
-    for item in EXPIRING:
+    for item in snapshot:
         if item["delete_at"] > now:
             remaining.append(item)
             continue
@@ -924,9 +935,10 @@ def delete_expired_messages():
             telegram("deleteMessage", {"chat_id": item["chat_id"], "message_id": item["message_id"]})
         except Exception as exc:
             print("delete-expired-message error:", exc, flush=True)
-    if len(remaining) != len(EXPIRING):
-        EXPIRING[:] = remaining
-        EXPIRY_STORE.save(EXPIRING)
+    if len(remaining) != len(snapshot):
+        with EXPIRING_LOCK:
+            EXPIRING[:] = remaining
+            EXPIRY_STORE.save(EXPIRING)
 
 
 def answer(callback_id, text=None):
@@ -1083,6 +1095,39 @@ def run_queue():
             save_blocked()
         if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
             qbit_action("resume", task_hash)
+
+    # --- Stall detection: auto-pause tasks stuck at 0% for over 30 min ---
+    now_mono = time.monotonic()
+    for task_hash in active_hashes:
+        item = task_by_hash.get(task_hash)
+        if not item:
+            continue
+        if float(item.get("progress") or 0) > 0:
+            # Making progress; clear any stall tracking.
+            STALL_FIRST_SEEN.pop(task_hash, None)
+            STALL_NOTIFIED.discard(task_hash)
+            continue
+        if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
+            continue
+        if task_hash not in STALL_FIRST_SEEN:
+            STALL_FIRST_SEEN[task_hash] = now_mono
+            continue
+        if now_mono - STALL_FIRST_SEEN[task_hash] >= STALL_THRESHOLD:
+            qbit_action("pause", task_hash)
+            if task_hash not in STALL_NOTIFIED:
+                STALL_NOTIFIED.add(task_hash)
+                send(
+                    OWNER,
+                    f"⚠️ 任务卡死已自动暂停\n\n"
+                    f"{item.get('name', '')[:55]}\n"
+                    f"已停留 0% 超过 {STALL_THRESHOLD // 60} 分钟。\n\n"
+                    "建议在「我的任务」中删除并换种。",
+                )
+    # Clean up stale entries for tasks no longer in the queue.
+    stale_stall = set(STALL_FIRST_SEEN) - set(QUEUE)
+    for task_hash in stale_stall:
+        STALL_FIRST_SEEN.pop(task_hash, None)
+        STALL_NOTIFIED.discard(task_hash)
 
 
 def show_tasks(chat_id):
@@ -1326,6 +1371,47 @@ def add_to_qbit(chat_id, user_id, category):
     if not pending:
         return send(chat_id, "这个下载请求已失效，请重新发送 magnet 链接或 .torrent 文件。", home_keyboard())
     before = {item["hash"] for item in task_list()}
+    # --- InfoHash conflict detection ---
+    # Check the secondary brush-traffic qBittorrent (if configured) to avoid
+    # both clients downloading the same torrent simultaneously.
+    if SETTINGS.qbit2_url and "magnet" in pending:
+        try:
+            qbit2 = QBitClient(
+                SETTINGS.qbit2_url,
+                SETTINGS.qbit2_username,
+                SETTINGS.qbit2_password,
+            )
+            remote_hashes = {
+                str(t.get("hash") or "").lower()
+                for t in qbit2.request("/api/v2/torrents/info").json()
+                if isinstance(t, dict)
+            }
+            # Extract infohash from the magnet URI.
+            xt_match = re.search(
+                r"xt=urn:btih:([a-fA-F0-9]{40})", pending["magnet"]
+            )
+            magnet_hash = xt_match.group(1).lower() if xt_match else ""
+            if not magnet_hash:
+                xt_match = re.search(
+                    r"xt=urn:btih:([A-Za-z2-7]{32})", pending["magnet"]
+                )
+                if xt_match:
+                    import base64
+                    magnet_hash = base64.b32decode(
+                        xt_match.group(1).upper()
+                    ).hex()
+            if magnet_hash and magnet_hash in remote_hashes:
+                return send(
+                    chat_id,
+                    f"⚠️ InfoHash 冲突\n\n"
+                    f"此种子已在刷流 qBittorrent 中下载。\n"
+                    f"哈希：{magnet_hash[:16]}…\n\n"
+                    "为避免双客户端同时下载同一种子，已取消添加。",
+                    home_keyboard(),
+                )
+        except Exception as exc:
+            # If the secondary qB is unreachable, proceed normally.
+            print(f"qbit2-infohash-check skipped: {exc}", flush=True)
     if "magnet" in pending:
         add_data = {
             "urls": pending["magnet"],

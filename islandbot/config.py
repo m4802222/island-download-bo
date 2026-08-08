@@ -84,6 +84,11 @@ class Settings:
     max_active_downloads: int
     auto_cleanup_completed: bool
     cleanup_interval_seconds: int
+    # Optional secondary qBittorrent (brush-traffic client) for InfoHash
+    # conflict detection.  Leave QBIT2_URL empty to disable.
+    qbit2_url: str
+    qbit2_username: str
+    qbit2_password: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -125,4 +130,7 @@ class Settings:
             max_active_downloads=_integer("MAX_ACTIVE_DOWNLOADS", 2),
             auto_cleanup_completed=_boolean("AUTO_CLEANUP_COMPLETED", True),
             cleanup_interval_seconds=_integer("CLEANUP_INTERVAL_SECONDS", 60, 30),
+            qbit2_url=os.environ.get("QBIT2_URL", "").strip().rstrip("/"),
+            qbit2_username=os.environ.get("QBIT2_USERNAME", "").strip(),
+            qbit2_password=os.environ.get("QBIT2_PASSWORD", "").strip(),
         )
