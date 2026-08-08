@@ -4,7 +4,7 @@ set -euo pipefail
 HOST_CONFIG="${HOST_CONFIG:-/root/.config/rclone/rclone.conf}"
 MP_CONFIG="${MP_CONFIG:-/opt/media/moviepilot/config/rclone/rclone.conf}"
 HOST_REMOTE="${HOST_REMOTE:-gdrive1}"
-MP_REMOTE="${MP_REMOTE:-MP}"
+MP_REMOTE="${MP_REMOTE:-gdrive1}"
 MEDIA_DIR="${MEDIA_DIR:-Media}"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -27,6 +27,11 @@ done
   echo "找不到 MoviePilot rclone 配置: $MP_CONFIG"
   exit 1
 }
+
+if [[ "$MP_REMOTE" == "MP" ]]; then
+  echo "拒绝覆盖 MP：MP 是固定指向 gdrive2 的别名"
+  exit 1
+fi
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 backup="${MP_CONFIG}.bak-oauth-${timestamp}"
@@ -61,10 +66,11 @@ for key in list(target[target_remote]):
 for key, value in source.items(source_remote):
     target.set(target_remote, key, value)
 
-# Truncate and rewrite the existing inode so containers with a read-only
-# single-file bind mount immediately see the refreshed credentials.
-with open(target_path, "w", encoding="utf-8") as handle:
+# The rclone directory is mounted read/write, so replace the file atomically.
+temporary_path = f"{target_path}.new"
+with open(temporary_path, "w", encoding="utf-8") as handle:
     target.write(handle, space_around_delimiters=True)
+os.replace(temporary_path, target_path)
 PY
 
 remote_path="${MP_REMOTE}:$MEDIA_DIR"
@@ -74,7 +80,7 @@ if ! rclone --config "$MP_CONFIG" lsd "$remote_path" --max-depth 1 >/dev/null; t
   exit 1
 fi
 
-if systemctl list-unit-files rclone-gdrive1.service >/dev/null 2>&1; then
+if [[ "$HOST_REMOTE" == "gdrive1" ]] && systemctl list-unit-files rclone-gdrive1.service >/dev/null 2>&1; then
   systemctl restart rclone-gdrive1.service
 fi
 
@@ -83,8 +89,8 @@ if docker inspect moviepilot >/dev/null 2>&1; then
 fi
 
 if docker inspect island-download-bot >/dev/null 2>&1; then
-  docker exec island-download-bot sh -c \
-    'r=MP$(printf "\072")Media; rclone --config /rclone/rclone.conf lsd "$r" --max-depth 1 >/dev/null'
+  docker exec island-download-bot rclone --config /rclone/rclone.conf \
+    lsd "$remote_path" --max-depth 1 >/dev/null
   docker restart island-download-bot >/dev/null
 fi
 
