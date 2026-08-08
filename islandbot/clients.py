@@ -298,6 +298,72 @@ class QBitClient:
             form["deleteFiles"] = "true"
         return self.request(f"/api/v2/torrents/{endpoint}", form=form).text
 
+    def sync_categories(
+        self,
+        desired: dict[str, str],
+        removable: set[str],
+    ) -> dict[str, list[str]]:
+        """Create/update desired categories and remove unused legacy names."""
+
+        current = self.request("/api/v2/torrents/categories").json()
+        if not isinstance(current, dict):
+            raise RuntimeError("qBittorrent 分类返回格式异常")
+        result: dict[str, list[str]] = {
+            "created": [],
+            "updated": [],
+            "removed": [],
+            "kept": [],
+        }
+        for name, save_path in desired.items():
+            existing = current.get(name)
+            if not isinstance(existing, dict):
+                self.request(
+                    "/api/v2/torrents/createCategory",
+                    form={"category": name, "savePath": save_path},
+                )
+                result["created"].append(name)
+                continue
+            old_path = str(existing.get("savePath") or "").rstrip("/")
+            if old_path != save_path.rstrip("/"):
+                self.request(
+                    "/api/v2/torrents/editCategory",
+                    form={"category": name, "savePath": save_path},
+                )
+                result["updated"].append(name)
+
+        tasks = self.request("/api/v2/torrents/info").json()
+        if not isinstance(tasks, list):
+            raise RuntimeError("qBittorrent 任务返回格式异常")
+        used = {str(task.get("category") or "") for task in tasks}
+        old_categories = sorted(removable.intersection(current))
+        removable_now = [name for name in old_categories if name not in used]
+        result["kept"] = [name for name in old_categories if name in used]
+        if removable_now:
+            self.request(
+                "/api/v2/torrents/removeCategories",
+                form={"categories": "\n".join(removable_now)},
+            )
+            result["removed"] = removable_now
+
+        verified = self.request("/api/v2/torrents/categories").json()
+        if not isinstance(verified, dict):
+            raise RuntimeError("qBittorrent 分类校验返回格式异常")
+        for name, save_path in desired.items():
+            actual = verified.get(name)
+            actual_path = (
+                str(actual.get("savePath") or "").rstrip("/")
+                if isinstance(actual, dict)
+                else None
+            )
+            if actual_path != save_path.rstrip("/"):
+                raise RuntimeError(f"qBittorrent 分类同步未生效：{name}")
+        remaining = sorted(set(removable_now).intersection(verified))
+        if remaining:
+            raise RuntimeError(
+                f"qBittorrent 旧分类删除未生效：{','.join(remaining)}"
+            )
+        return result
+
     def files(self, torrent_hash: str) -> list[dict[str, Any]]:
         query = urllib.parse.urlencode({"hash": torrent_hash})
         payload = self.request(f"/api/v2/torrents/files?{query}").json()

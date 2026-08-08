@@ -20,6 +20,13 @@ from .clients import (
     QBitClient,
     TelegramClient,
 )
+from .categories import (
+    CANONICAL_CATEGORIES,
+    LEGACY_QBIT_CATEGORIES,
+    download_path,
+    load_moviepilot_categories,
+    qbit_category_paths,
+)
 from .cleanup import is_brush_task, safe_to_cleanup, successful_source_paths
 from .library import missing_plan
 from .media import (
@@ -111,13 +118,16 @@ RESOLVER = MediaResolver(
     IDENTITIES,
 )
 
-CATEGORIES = ["国产电影", "国产动漫", "国产剧集", "港台剧集", "欧美电影", "欧美剧集", "日韩电影", "日韩剧集", "日韩动漫"]
+CATEGORIES = list(CANONICAL_CATEGORIES)
 TELEGRAM_CLIENT = TelegramClient(TOKEN)
 ARIA2_CLIENT = Aria2Client(ARIA2_URL, ARIA2_SECRET)
 QAS_CLIENT = QasClient(QAS_URL, QAS_USER, QAS_PASSWORD)
 QBIT_CLIENT = QBitClient(QBIT_URL, QBIT_USER, QBIT_PASSWORD)
 EMBY_CLIENT = EmbyClient(SETTINGS.emby_url, SETTINGS.emby_api_key)
 LAST_QBIT_CLEANUP = 0.0
+LAST_CATEGORY_SYNC = 0.0
+CATEGORY_SYNC_INTERVAL = 6 * 60 * 60
+CATEGORY_SYNC_RETRY_INTERVAL = 5 * 60
 
 
 def request(url, data=None, headers=None):
@@ -773,8 +783,33 @@ def qbit_add_torrent_file(filename, content, category):
         filename,
         content,
         category,
-        QBIT_SAVE_PATH,
+        download_path(category, QBIT_SAVE_PATH, CATEGORIES),
     )
+
+
+def synchronize_media_categories():
+    """Keep the bot and qBittorrent aligned with MoviePilot's nine categories."""
+
+    global LAST_CATEGORY_SYNC
+    categories = load_moviepilot_categories(
+        SETTINGS.moviepilot_category_file,
+        required=True,
+    )
+    result = QBIT_CLIENT.sync_categories(
+        qbit_category_paths(categories, QBIT_SAVE_PATH),
+        set(LEGACY_QBIT_CATEGORIES),
+    )
+    CATEGORIES[:] = categories
+    LAST_CATEGORY_SYNC = time.monotonic()
+    print(
+        "MEDIA_CATEGORIES_READY "
+        f"created={len(result['created'])} "
+        f"updated={len(result['updated'])} "
+        f"removed={len(result['removed'])} "
+        f"kept={len(result['kept'])}",
+        flush=True,
+    )
+    return result
 
 
 def qbit_files(torrent_hash):
@@ -1276,7 +1311,7 @@ def add_to_qbit(chat_id, user_id, category):
             "tags": "islandbot",
             "autoTMM": "false",
             "stopCondition": "MetadataReceived",
-            "savepath": QBIT_SAVE_PATH,
+            "savepath": download_path(category, QBIT_SAVE_PATH, CATEGORIES),
         }
         if category != "__auto__":
             add_data["category"] = category
@@ -1755,9 +1790,26 @@ def watch_aria2_completed():
 
 def main():
     """Run the Telegram long-polling worker."""
+    global LAST_CATEGORY_SYNC
     print(f"Island Download Bot {__version__} started", flush=True)
+    while not LAST_CATEGORY_SYNC:
+        try:
+            synchronize_media_categories()
+        except Exception as exc:
+            print(f"media-category-sync error: {exc}", flush=True)
+            time.sleep(10)
     while True:
         try:
+            if time.monotonic() - LAST_CATEGORY_SYNC >= CATEGORY_SYNC_INTERVAL:
+                try:
+                    synchronize_media_categories()
+                except Exception as exc:
+                    print(f"media-category-sync error: {exc}", flush=True)
+                    LAST_CATEGORY_SYNC = (
+                        time.monotonic()
+                        - CATEGORY_SYNC_INTERVAL
+                        + CATEGORY_SYNC_RETRY_INTERVAL
+                    )
             updates = telegram(
                 "getUpdates",
                 {

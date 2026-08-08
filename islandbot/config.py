@@ -77,6 +77,7 @@ class Settings:
     downloads_dir: Path
     qbit_save_path: str
     moviepilot_db: Path
+    moviepilot_category_file: Path
     rclone_config: Path
     drive_remote: str
     min_free_gib: int
@@ -112,6 +113,12 @@ class Settings:
                 "QBIT_SAVE_PATH", "/downloads/complete/islandbot"
             ).rstrip("/"),
             moviepilot_db=Path(os.environ.get("MOVIEPILOT_DB", "/moviepilot-config/user.db")),
+            moviepilot_category_file=Path(
+                os.environ.get(
+                    "MOVIEPILOT_CATEGORY_FILE",
+                    "/moviepilot-config/category.yaml",
+                )
+            ),
             rclone_config=Path(os.environ.get("RCLONE_CONFIG", "/rclone/rclone.conf")),
             drive_remote=os.environ.get("DRIVE_REMOTE", "MP:Media"),
             min_free_gib=_integer("MIN_FREE_GIB", 10),

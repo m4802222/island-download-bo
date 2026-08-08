@@ -4,7 +4,7 @@ set -euo pipefail
 bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
-ref=${ISLAND_BOT_REF:-v2.1.1}
+ref=${ISLAND_BOT_REF:-v2.2.0}
 archive_url="https://codeload.github.com/m4802222/island-download-bo/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
@@ -128,6 +128,22 @@ fi
 
 if ! docker exec "$container" sh -c \
     'python -m py_compile /app/simplebot.py /app/islandbot/*.py && python -c "import islandbot; print(islandbot.__version__)"'; then
+    restore_previous
+fi
+
+category_ready=false
+for _ in {1..15}; do
+    if docker logs "$container" 2>&1 | grep -q 'MEDIA_CATEGORIES_READY'; then
+        category_ready=true
+        break
+    fi
+    if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" != true ]; then
+        break
+    fi
+    sleep 2
+done
+if [ "$category_ready" != true ]; then
+    docker logs --tail 30 "$container" 2>&1 || true
     restore_previous
 fi
 

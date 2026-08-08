@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from islandbot.config import Settings, explicit_web_port
@@ -33,6 +34,10 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.min_free_gib, 5)
         self.assertEqual(settings.max_active_downloads, 3)
         self.assertEqual(settings.qbit_save_path, "/downloads/complete/islandbot")
+        self.assertEqual(
+            settings.moviepilot_category_file,
+            Path("/moviepilot-config/category.yaml"),
+        )
         self.assertTrue(settings.auto_cleanup_completed)
         self.assertEqual(settings.cleanup_interval_seconds, 60)
 

@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.1.1`。
+当前稳定版本：`v2.2.0`。
 
 ## 2.0 重构重点
 
@@ -36,6 +36,8 @@ Google Drive 的媒体流程。
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
 - MoviePilot 的 rclone 上传失败时保留源文件、暂停普通下载并按错误类型退避重试；
   Google Drive 恢复后自动续传并恢复被系统暂停的任务，刷流任务始终不受影响
+- 分类名称直接读取 MoviePilot 的 `category.yaml` 并严格校验“华语 / 日韩 / 海外”
+  九分类；qBittorrent 自动补齐对应分类和保存路径，无任务占用时移除旧“欧美”分类
 
 ## 夸克确认流程
 
@@ -66,7 +68,7 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.1.1/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.2.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
