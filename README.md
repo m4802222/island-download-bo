@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.2.0`。
+当前稳定版本：`v2.2.1`。
 
 ## 2.0 重构重点
 
@@ -38,6 +38,10 @@ Google Drive 的媒体流程。
   Google Drive 恢复后自动续传并恢复被系统暂停的任务，刷流任务始终不受影响
 - 分类名称直接读取 MoviePilot 的 `category.yaml` 并严格校验“华语 / 日韩 / 海外”
   九分类；qBittorrent 自动补齐对应分类和保存路径，无任务占用时移除旧“欧美”分类
+- 正式九分类文件由仓库 `config/category.yaml` 管理；每次部署先备份 MoviePilot
+  当前文件，并记录版本、Git 提交号、部署时间和分类文件哈希
+- OAuth 同步只允许选择 `gdrive1` 或 `gdrive2`，且只替换对应的 `token`；
+  另一个账号和固定 `MP -> gdrive2:` 别名不会被改写
 
 ## 夸克确认流程
 
@@ -68,7 +72,7 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.2.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.2.1/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
@@ -76,6 +80,16 @@ bash /tmp/deploy-vps.sh
 MoviePilot 的 rclone 配置挂载到 `/rclone:rw`，避免 OAuth 刷新后容器仍读取旧文件。
 部署完成后还会安装上传恢复定时器；它只重试源文件仍存在的 rclone 上传失败记录，
 不会重试识别失败、文件不存在或已经成功的历史记录。
+
+同步某个 Google Drive 账号的 OAuth token 时，必须显式指定远程名称：
+
+```bash
+REMOTE=gdrive1 /opt/media/downloadbot/scripts/sync-rclone-oauth.sh
+REMOTE=gdrive2 /opt/media/downloadbot/scripts/sync-rclone-oauth.sh
+```
+
+脚本只接受这两个名称，只更新对应的 `token`，执行前自动备份 MoviePilot 的
+rclone 配置。当前部署记录保存在 `/opt/media/downloadbot/deployment.json`。
 
 `.env` 不应上传至 GitHub。
 
