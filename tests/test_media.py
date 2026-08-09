@@ -4,8 +4,10 @@ from islandbot.library import indexed_episodes, missing_plan
 from islandbot.media import (
     MediaIdentity,
     alias_key,
+    bare_episode_number,
     episode_key,
     explicit_seasons,
+    normalize_bare_episode_filename,
     parse_identity_label,
     season_number,
 )
@@ -23,6 +25,25 @@ class MediaParsingTests(unittest.TestCase):
         self.assertEqual(episode_key("08.mkv", 2), "S02E008")
         self.assertEqual(episode_key("第 8 集.mp4", 2), "S02E008")
         self.assertEqual(episode_key("Show.S02E08.mkv"), "S02E008")
+
+    def test_bare_episode_filename_is_normalized_for_confirmed_tv(self):
+        source = "08.2160p.HD国语中字无水印.mkv"
+        self.assertEqual(bare_episode_number(source), 8)
+        self.assertEqual(
+            normalize_bare_episode_filename(source, "这一秒过火", 1),
+            "这一秒过火.S01E08.2160p.HD国语中字无水印.mkv",
+        )
+
+    def test_normalizer_skips_incomplete_and_explicit_names(self):
+        self.assertIsNone(
+            normalize_bare_episode_filename("08.mkv.!qB", "这一秒过火", 1)
+        )
+        self.assertIsNone(
+            normalize_bare_episode_filename("Show.S01E08.mkv", "这一秒过火", 1)
+        )
+        self.assertIsNone(
+            normalize_bare_episode_filename("08.mkv", "", 1)
+        )
 
     def test_explicit_seasons_are_read_from_release_names(self):
         self.assertEqual(explicit_seasons("Flex.x.Cop.S02E01.1080p.mkv"), {2})

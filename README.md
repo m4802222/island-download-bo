@@ -3,13 +3,16 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.4.1`。
+当前稳定版本：`v2.4.2`。
 
 ## 2.0 重构重点
 
 - 下载前先建立结构化媒体身份：名称、年份、TMDB、类型、季数。
 - 电视剧目录统一为 `名称 (年份) {tmdb-ID} Sxx`，裸文件 `01.mkv`
   也会按已确认季数生成正确的 `SxxE01`。
+- qBittorrent 单集文件完成后若只有 `08.2160p...mkv` 这类裸编号，机器人先通过
+  qBittorrent 重命名接口补齐剧名和季集号，再通知 MoviePilot；未完成的 `.mkv.!qB`
+  文件、电影、刷流任务或无法确认媒体身份的任务不会改名。
 - 只按“同一 TMDB 对应的名称 + 同一季 + 同一集”查重。第一季不会再导致
   第二季整季被跳过。
 - 自动识别第二季时拒绝使用“某某 第2季”这类独立重复 TMDB 条目；
@@ -75,7 +78,7 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.1/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.2/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 

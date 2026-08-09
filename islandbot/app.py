@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import __version__
 from .clients import (
@@ -31,10 +31,12 @@ from .cleanup import is_brush_task, safe_to_cleanup, selected_video_sizes
 from .library import missing_plan
 from .media import (
     VIDEO_EXTENSIONS,
+    bare_episode_number,
     clean_title,
     episode_key as domain_episode_key,
     episode_keys as domain_episode_keys,
     explicit_seasons,
+    normalize_bare_episode_filename,
     parse_identity_label,
     season_number,
 )
@@ -142,6 +144,12 @@ RESOLVER = MediaResolver(
     MoviePilotClient(MOVIEPILOT_URL, MOVIEPILOT_TOKEN),
     IDENTITIES,
 )
+# A successful identity is reused for the lifetime of the process. Failed
+# probes are throttled so a malformed torrent cannot cause a network request
+# on every polling tick.
+NORMALIZE_IDENTITY_CACHE = {}
+NORMALIZE_LAST_ATTEMPT = {}
+NORMALIZE_RETRY_SECONDS = 300
 
 CATEGORIES = list(CANONICAL_CATEGORIES)
 TELEGRAM_CLIENT = TelegramClient(TOKEN)
@@ -992,6 +1000,135 @@ def task_list():
     return json.loads(qbit("/api/v2/torrents/info?tag=islandbot&sort=added_on&reverse=true"))
 
 
+def _release_title_probe(value):
+    """Strip common release suffixes before asking MoviePilot to identify it."""
+
+    text = Path(str(value or "")).name
+    text = re.sub(r"(?i)\s*\{tmdb-\d+\}.*$", "", text)
+    text = re.sub(
+        r"(?i)[ ._-]+(?:8k|4k|2160p|1440p|1080p|720p|576p|480p|web[- .]?dl|webrip|bluray|bdrip|hdtv|dvdrip)(?:[ ._-].*)?$",
+        "",
+        text,
+    )
+    return text.strip(" ._-")
+
+
+def _completed_task_root(item):
+    """Return a bot-owned qBittorrent content directory, if it is visible."""
+
+    base = Path(QBIT_SAVE_PATH)
+    raw = item.get("content_path") or item.get("save_path") or str(base)
+    root = Path(str(raw))
+    if root.is_file():
+        root = root.parent
+    try:
+        root.relative_to(base)
+    except ValueError:
+        return None
+    if root == base:
+        name = str(item.get("name") or "").strip()
+        candidate = base / name if name else None
+        if not candidate or not candidate.is_dir():
+            return None
+        root = candidate
+    return root if root.is_dir() else None
+
+
+def _confirmed_tv_identity(item, root):
+    """Resolve a completed torrent folder conservatively as a TV identity."""
+
+    key = f"{item.get('hash') or ''}|{root}"
+    cached = NORMALIZE_IDENTITY_CACHE.get(key)
+    if cached:
+        return cached
+    now = time.monotonic()
+    last_attempt = NORMALIZE_LAST_ATTEMPT.get(key)
+    if last_attempt is not None and now - last_attempt < NORMALIZE_RETRY_SECONDS:
+        return None
+    NORMALIZE_LAST_ATTEMPT[key] = now
+    probes = [root.name, item.get("name")]
+    for probe in probes:
+        title = _release_title_probe(probe)
+        if not title:
+            continue
+        try:
+            identity = RESOLVER.automatic(title)
+        except (ResolutionError, ValueError) as exc:
+            print(f"episode-normalizer resolve skipped {title}: {exc}", flush=True)
+            continue
+        if identity.media_type != "电视剧":
+            print(f"episode-normalizer skipped non-TV task: {title}", flush=True)
+            continue
+        NORMALIZE_IDENTITY_CACHE[key] = identity
+        return identity
+    print(f"episode-normalizer skipped ambiguous task: {root}", flush=True)
+    return None
+
+
+def normalize_completed_episode_files(tasks):
+    """Rename completed bare episode files before MoviePilot scans them.
+
+    Only files with a real video extension are considered, so qBittorrent's
+    active ``.mkv.!qB`` files are never touched. Movies, brush tasks and folders
+    whose TV identity cannot be confirmed are left unchanged.
+    """
+
+    renamed = []
+    for item in tasks or []:
+        if is_brush_task(item):
+            continue
+        root = _completed_task_root(item)
+        if not root:
+            continue
+        task_hash = str(item.get("hash") or "")
+        if not task_hash:
+            continue
+        try:
+            files = QBIT_CLIENT.files(task_hash)
+        except Exception as exc:
+            print(f"episode-normalizer files {task_hash[:12]} failed: {exc}", flush=True)
+            continue
+        candidates = []
+        for file_item in files:
+            if float(file_item.get("progress") or 0) < 1:
+                continue
+            old_path = str(file_item.get("name") or "")
+            old_name = PurePosixPath(old_path).name
+            if bare_episode_number(old_name) is not None:
+                candidates.append((old_path, old_name))
+        if not candidates:
+            continue
+        identity = _confirmed_tv_identity(item, root)
+        if not identity:
+            continue
+        existing_paths = {
+            str(file_item.get("name") or "")
+            for file_item in files
+            if file_item.get("name")
+        }
+        for old_path, old_name in candidates:
+            target_name = normalize_bare_episode_filename(
+                old_name,
+                identity.title,
+                identity.season or 1,
+            )
+            if not target_name:
+                continue
+            target_path = str(PurePosixPath(old_path).with_name(Path(target_name).name))
+            if target_path in existing_paths:
+                print(f"episode-normalizer conflict, keeping {old_path}", flush=True)
+                continue
+            try:
+                QBIT_CLIENT.rename_file(task_hash, old_path, target_path)
+            except Exception as exc:
+                print(f"episode-normalizer rename failed {old_path}: {exc}", flush=True)
+                continue
+            renamed.append((old_path, target_path))
+            existing_paths.add(target_path)
+            print(f"episode-normalizer renamed {old_name} -> {Path(target_path).name}", flush=True)
+    return renamed
+
+
 def save_queue():
     QUEUE_STORE.save(QUEUE)
 
@@ -1813,14 +1950,22 @@ def handle(update):
 
 def watch_completed():
     global SEEN
+    tasks = task_list()
+    renamed = normalize_completed_episode_files(tasks)
     # Collect all newly completed tasks first, then trigger MoviePilot once.
     # Previously each task triggered a separate transfer-now call, which was
     # redundant because MoviePilot scans all completed downloads in one pass.
     newly_done = [
-        item for item in task_list()
+        item for item in tasks
         if item.get("progress", 0) >= 1 and item["hash"] not in SEEN
     ]
-    if newly_done:
+    transfer_triggered = bool(renamed)
+    if renamed:
+        try:
+            moviepilot_transfer_now()
+        except Exception as exc:
+            print(f"moviepilot-transfer-now after episode normalization error: {exc}", flush=True)
+    if newly_done and not transfer_triggered:
         try:
             moviepilot_transfer_now()
         except Exception as exc:

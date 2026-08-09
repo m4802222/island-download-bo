@@ -96,6 +96,20 @@ class QBitClientTests(unittest.TestCase):
         self.assertIn("/api/v2/torrents/stop", mocked.call_args.args[0])
         self.assertEqual(mocked.call_args.kwargs["form"]["hashes"], "abc")
 
+    def test_rename_file_uses_qbittorrent_endpoint(self):
+        client = QBitClient("http://qbit:8080", "admin", "secret")
+        client.cookie = "SID=test"
+        with patch(
+            "islandbot.clients.fetch",
+            return_value=Response(200, b"", {}),
+        ) as mocked:
+            client.rename_file("abc", "08.mkv", "Show.S01E08.mkv")
+        self.assertIn("/api/v2/torrents/renameFile", mocked.call_args.args[0])
+        self.assertEqual(
+            mocked.call_args.kwargs["form"],
+            {"hash": "abc", "oldPath": "08.mkv", "newPath": "Show.S01E08.mkv"},
+        )
+
     def test_unauthorized_request_relogs_once(self):
         client = QBitClient("http://qbit:8080", "admin", "secret")
         client.cookie = "SID=expired"

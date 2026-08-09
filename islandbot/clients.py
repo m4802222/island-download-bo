@@ -392,6 +392,18 @@ class QBitClient:
         payload = self.request(f"/api/v2/torrents/files?{query}").json()
         return payload if isinstance(payload, list) else []
 
+    def rename_file(self, torrent_hash: str, old_path: str, new_path: str) -> str:
+        """Rename one file through qBittorrent, without writing the download mount."""
+
+        return self.request(
+            "/api/v2/torrents/renameFile",
+            form={
+                "hash": torrent_hash,
+                "oldPath": old_path,
+                "newPath": new_path,
+            },
+        ).text
+
     def add_torrent(
         self,
         filename: str,

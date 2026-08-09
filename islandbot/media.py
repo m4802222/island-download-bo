@@ -133,6 +133,51 @@ def explicit_episode_key(value: str) -> str | None:
     return f"S{int(match.group(1)):02d}E{int(match.group(2)):03d}"
 
 
+def bare_episode_number(value: str) -> int | None:
+    """Return the episode number from a bare completed filename.
+
+    Release files such as ``08.2160p...mkv`` are common in season torrents,
+    but they are ambiguous until the containing task has been confirmed as a
+    TV identity.  Incomplete qBittorrent files (``.mkv.!qB``) are rejected by
+    the video-extension check and therefore can never be renamed here.
+    """
+
+    path = Path(value)
+    if path.suffix.lower() not in VIDEO_EXTENSIONS:
+        return None
+    if explicit_episode_key(path.name):
+        return None
+    match = re.match(r"^0*(\d{1,3})(?=[ ._-])", path.name)
+    if not match:
+        return None
+    episode = int(match.group(1))
+    return episode if 1 <= episode <= 999 else None
+
+
+def normalize_bare_episode_filename(
+    value: str,
+    title: str,
+    season: int = 1,
+) -> str | None:
+    """Build a MoviePilot-friendly name for a bare episode file.
+
+    Only a confirmed TV identity may call this helper.  It deliberately
+    returns ``None`` for movies, explicit ``SxxExx`` names and incomplete
+    download suffixes, leaving ambiguous files untouched.
+    """
+
+    episode = bare_episode_number(value)
+    if episode is None:
+        return None
+    if not title or not title.strip() or not 1 <= int(season) <= 99:
+        return None
+    path = Path(value)
+    safe_title = clean_title(title)
+    prefix_end = re.match(r"^0*\d{1,3}", path.name).end()
+    remainder = path.name[prefix_end:]
+    return str(path.with_name(f"{safe_title}.S{int(season):02d}E{episode:02d}{remainder}"))
+
+
 def explicit_seasons(value: str) -> set[int]:
     """Return seasons explicitly encoded in episode-style release names."""
 

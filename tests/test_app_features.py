@@ -1,7 +1,12 @@
 """Tests for newly added app-level features: InfoHash extraction and SEEN migration."""
 
 import re
+import importlib
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 class InfoHashExtractionTests(unittest.TestCase):
@@ -99,6 +104,67 @@ class SeenMigrationTests(unittest.TestCase):
         cleaned = {h: t for h, t in seen.items() if t >= cutoff}
         self.assertIn("recent", cleaned)
         self.assertNotIn("old", cleaned)
+
+
+class EpisodeNormalizerTests(unittest.TestCase):
+    def test_completed_bare_file_uses_qbit_rename_api(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp) / "complete" / "islandbot"
+            root = base / "这一秒过火.2160p"
+            root.mkdir(parents=True)
+            env = {
+                "BOT_TOKEN": "test",
+                "OWNER_ID": "1",
+                "QBIT_USERNAME": "test",
+                "QBIT_PASSWORD": "test",
+                "DATA_DIR": str(Path(temp) / "data"),
+                "QBIT_SAVE_PATH": str(base),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                app = importlib.import_module("islandbot.app")
+            from islandbot.media import MediaIdentity
+
+            original_qbit = app.QBIT_CLIENT
+            original_resolver = app.RESOLVER
+            try:
+                qbit = Mock()
+                qbit.files.return_value = [
+                    {"name": "08.2160p.mkv", "progress": 1.0},
+                    {"name": "09.2160p.mkv", "progress": 0.2},
+                ]
+                resolver = Mock()
+                resolver.automatic.return_value = MediaIdentity(
+                    "这一秒过火", "289139", 2026, 1, "电视剧"
+                )
+                app.QBIT_CLIENT = qbit
+                app.RESOLVER = resolver
+                app.NORMALIZE_IDENTITY_CACHE.clear()
+                app.NORMALIZE_LAST_ATTEMPT.clear()
+
+                result = app.normalize_completed_episode_files(
+                    [
+                        {
+                            "hash": "abc",
+                            "content_path": str(root),
+                            "name": "这一秒过火.2160p",
+                            "category": "华语剧集",
+                            "tags": "islandbot",
+                        }
+                    ]
+                )
+
+                self.assertEqual(
+                    result,
+                    [("08.2160p.mkv", "这一秒过火.S01E08.2160p.mkv")],
+                )
+                qbit.rename_file.assert_called_once_with(
+                    "abc",
+                    "08.2160p.mkv",
+                    "这一秒过火.S01E08.2160p.mkv",
+                )
+            finally:
+                app.QBIT_CLIENT = original_qbit
+                app.RESOLVER = original_resolver
 
 
 if __name__ == "__main__":
