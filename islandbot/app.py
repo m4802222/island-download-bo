@@ -34,6 +34,7 @@ from .media import (
     clean_title,
     episode_key as domain_episode_key,
     episode_keys as domain_episode_keys,
+    explicit_seasons,
     parse_identity_label,
     season_number,
 )
@@ -525,6 +526,17 @@ def quark_missing_plan(share_url, media_title):
     identity = parse_identity_label(media_title)
     if not identity:
         raise RuntimeError("媒体身份格式异常，未进行缺集判断")
+    source_seasons = {
+        season
+        for name in files
+        for season in explicit_seasons(name)
+    }
+    if source_seasons and source_seasons != {identity.season}:
+        seasons = "、".join(f"第 {season} 季" for season in sorted(source_seasons))
+        raise RuntimeError(
+            f"分享文件明确标记为 {seasons}，但当前确认身份是第 {identity.season} 季。"
+            "已停止下载，请修改媒体身份后重试。"
+        )
     history_paths, _ = moviepilot_existing(media_title)
     drive_paths, _ = google_drive_existing(media_title)
     plan = missing_plan(files, [*history_paths, *drive_paths], identity)
@@ -872,6 +884,17 @@ def apply_moviepilot_dedupe(torrent_hash, media_title):
     history_paths, _ = moviepilot_existing(media_title)
     drive_paths, _ = google_drive_existing(media_title)
     source_names = [str(item.get("name", "")) for item in videos]
+    source_seasons = {
+        season
+        for name in source_names
+        for season in explicit_seasons(name)
+    }
+    if source_seasons and source_seasons != {identity.season}:
+        seasons = "、".join(f"第 {season} 季" for season in sorted(source_seasons))
+        raise RuntimeError(
+            f"种子文件明确标记为 {seasons}，但当前确认身份是第 {identity.season} 季。"
+            "已停止下载，请修改媒体身份后重试。"
+        )
     plan = missing_plan(source_names, [*history_paths, *drive_paths], identity)
     missing_names = set(plan.missing_names)
     skip_ids = [

@@ -145,7 +145,10 @@ class MediaResolver:
                     f"TMDB {tmdb_id} 同时存在电影和电视剧，请回复“电视剧 {tmdb_id}”或“电影 {tmdb_id}”"
                 )
         identity = candidates[0]
-        self.identities.remember(source_title, identity)
+        remember_source = source_title
+        if season is not None:
+            remember_source = f"{source_title} S{requested_season:02d}"
+        self.identities.remember(remember_source, identity)
         return identity
 
     def reply(self, source_title: str, text: str) -> MediaIdentity:

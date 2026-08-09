@@ -5,6 +5,7 @@ from islandbot.media import (
     MediaIdentity,
     alias_key,
     episode_key,
+    explicit_seasons,
     parse_identity_label,
     season_number,
 )
@@ -22,6 +23,11 @@ class MediaParsingTests(unittest.TestCase):
         self.assertEqual(episode_key("08.mkv", 2), "S02E008")
         self.assertEqual(episode_key("第 8 集.mp4", 2), "S02E008")
         self.assertEqual(episode_key("Show.S02E08.mkv"), "S02E008")
+
+    def test_explicit_seasons_are_read_from_release_names(self):
+        self.assertEqual(explicit_seasons("Flex.x.Cop.S02E01.1080p.mkv"), {2})
+        self.assertEqual(explicit_seasons("S01E01-S02E02.mkv"), {1, 2})
+        self.assertEqual(explicit_seasons("01.mkv"), set())
 
     def test_identity_round_trip(self):
         identity = parse_identity_label(

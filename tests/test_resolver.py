@@ -42,7 +42,15 @@ class ResolverTests(unittest.TestCase):
             self.assertEqual(confirmed.season, 2)
             again = resolver.automatic("斩神 第二季 (2026)")
             self.assertEqual(again.tmdb_id, "259231")
-            self.assertEqual(again.season, 2)
+        self.assertEqual(again.season, 2)
+
+    def test_explicit_season_is_stored_when_source_has_no_season(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = IdentityStore(Path(directory) / "identities.json")
+            resolver = MediaResolver(FakeMoviePilot(), store)
+            resolver.reply("斩神 (2026)", "259231 第2季")
+            self.assertIsNone(store.get("斩神 (2026)"))
+            self.assertEqual(store.get("斩神 (2026) S02").season, 2)
 
     def test_first_and_second_season_aliases_do_not_collide(self):
         with tempfile.TemporaryDirectory() as directory:

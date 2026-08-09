@@ -133,6 +133,15 @@ def explicit_episode_key(value: str) -> str | None:
     return f"S{int(match.group(1)):02d}E{int(match.group(2)):03d}"
 
 
+def explicit_seasons(value: str) -> set[int]:
+    """Return seasons explicitly encoded in episode-style release names."""
+
+    return {
+        int(season)
+        for season in re.findall(r"(?i)(?<![A-Z0-9])S(\d{1,2})E\d{1,3}(?!\d)", value)
+    }
+
+
 def episode_key(value: str, default_season: int | None = None) -> str | None:
     """Extract one episode key, including bare ``01.mkv`` when season is known."""
 
