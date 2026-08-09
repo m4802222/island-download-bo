@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
 """Daily full-chain health check with Telegram report.
 
-Run from the Docker host via systemd timer or cron:
-
-    # systemd timer (recommended)
-    # /etc/systemd/system/island-health.service
-    [Unit]
-    Description=Island Download Bot daily health check
-    [Service]
-    Type=oneshot
-    ExecStart=/usr/bin/python3 /opt/media/downloadbot/scripts/health-check.py
-    WorkingDirectory=/opt/media/downloadbot
-
-    # /etc/systemd/system/island-health.timer
-    [Unit]
-    Description=Run Island health check daily at 08:00
-    [Timer]
-    OnCalendar=*-*-* 08:00:00
-    Persistent=true
-    [Install]
-    WantedBy=timers.target
-
-    systemctl enable --now island-health.timer
-
-Or simple cron:
-
-    0 8 * * * /usr/bin/python3 /opt/media/downloadbot/scripts/health-check.py
+The release deployment installs a systemd timer for 08:00 Asia/Shanghai.
+For a manual report, run with ``--dry-run``.
 """
 
 from __future__ import annotations
@@ -39,18 +16,20 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 BOT_DIR = Path("/opt/media/downloadbot")
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 DOWNLOADS = Path("/opt/media/downloads")
 MOVIEPILOT_CONTAINER = "moviepilot"
 BOT_CONTAINER = "island-download-bot"
 BLOCK_FILE = BOT_DIR / "data" / "cloud-upload-block.json"
 
-sys.path.insert(0, str(BOT_DIR))
+sys.path.insert(0, str(BOT_DIR if BOT_DIR.is_dir() else PROJECT_DIR))
 
 from islandbot.retry import (  # noqa: E402
     HEALTHY,
     classify_probe_error,
     cloud_block_status,
 )
+from islandbot.categories import CANONICAL_CATEGORIES  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +130,21 @@ def check_rclone_write() -> tuple[str, str]:
         return "🔴", f"Google Drive 写入：{exc}"
 
 
+def check_mp_alias() -> tuple[str, str]:
+    """Confirm MoviePilot's MP alias still targets gdrive2 only."""
+    try:
+        result = run(
+            ["docker", "exec", MOVIEPILOT_CONTAINER, "rclone", "config", "redacted", "MP"],
+            timeout=10,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode == 0 and "type = alias" in output and "remote = gdrive2:" in output:
+            return "🟢", "MP 云盘别名：指向 gdrive2"
+        return "🔴", f"MP 云盘别名：异常 — {output.strip()[-120:] or '未找到'}"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "🔴", f"MP 云盘别名：检测失败 — {exc}"
+
+
 def check_docker_service(container: str, display_name: str) -> tuple[str, str]:
     """Check if a Docker container is running."""
     try:
@@ -169,10 +163,12 @@ def check_docker_service(container: str, display_name: str) -> tuple[str, str]:
 def check_qbittorrent() -> tuple[str, str]:
     """Check qBittorrent via the bot container's API client."""
     code = (
-        "import json; from islandbot.app import QBIT_CLIENT; "
+        "import json; from islandbot.app import QBIT_CLIENT; from islandbot.cleanup import is_brush_task; "
         "tasks=QBIT_CLIENT.request('/api/v2/torrents/info').json(); "
         "active=[t for t in tasks if float(t.get('progress') or 0)<1]; "
-        "print('__HEALTH__'+json.dumps({'total':len(tasks),'active':len(active)}))"
+        "completed=[t for t in tasks if float(t.get('progress') or 0)>=1 and not is_brush_task(t)]; "
+        "stalled=[t for t in tasks if t.get('state')=='stalledDL' and float(t.get('progress') or 0)==0 and not is_brush_task(t)]; "
+        "print('__HEALTH__'+json.dumps({'total':len(tasks),'active':len(active),'completed':len(completed),'stalled':len(stalled)}))"
     )
     try:
         result = run(
@@ -184,7 +180,14 @@ def check_qbittorrent() -> tuple[str, str]:
                 data = json.loads(line.removeprefix("__HEALTH__"))
                 total = data.get("total", 0)
                 active = data.get("active", 0)
-                return "🟢", f"qBittorrent：在线（{total} 个任务，{active} 个下载中）"
+                completed = data.get("completed", 0)
+                stalled = data.get("stalled", 0)
+                extra = ""
+                if completed:
+                    extra += f"，{completed} 个普通任务待清理"
+                if stalled:
+                    extra += f"，{stalled} 个 0% 卡住"
+                return ("🟡" if completed or stalled else "🟢"), f"qBittorrent：在线（{total} 个任务，{active} 个下载中{extra}）"
         return "🟡", "qBittorrent：在线但数据读取失败"
     except (subprocess.TimeoutExpired, OSError):
         return "🔴", "qBittorrent：连接失败"
@@ -240,6 +243,80 @@ def check_emby() -> tuple[str, str]:
         return "🔴", "Emby：连接失败"
 
 
+def check_media_mount() -> tuple[str, str]:
+    """Confirm the host mediaunion rclone mount is present."""
+    try:
+        result = run(
+            ["findmnt", "-T", "/mnt/gdrive1", "-o", "SOURCE,FSTYPE", "-n"],
+            timeout=10,
+        )
+        value = result.stdout.strip()
+        if result.returncode == 0 and "mediaunion" in value and "fuse.rclone" in value:
+            return "🟢", "mediaunion 挂载：正常"
+        return "🔴", f"mediaunion 挂载：异常 — {value or result.stderr.strip()[:100]}"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "🔴", f"mediaunion 挂载：检测失败 — {exc}"
+
+
+def check_media_union() -> tuple[str, str]:
+    """Confirm mediaunion contains both read-only cloud remotes."""
+    try:
+        result = run(["rclone", "config", "redacted", "mediaunion"], timeout=10)
+        output = result.stdout + result.stderr
+        if (
+            result.returncode == 0
+            and "type = union" in output
+            and "gdrive1:Media" in output
+            and "gdrive2:Media" in output
+        ):
+            return "🟢", "mediaunion 配置：包含 gdrive1 + gdrive2"
+        return "🔴", f"mediaunion 配置：异常 — {output.strip()[-120:] or '未找到'}"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "🔴", f"mediaunion 配置：检测失败 — {exc}"
+
+
+def check_cloud_categories() -> tuple[str, str]:
+    """Confirm the union cloud view exposes all nine canonical directories."""
+    try:
+        result = run(
+            ["rclone", "lsf", "mediaunion:Media", "--dirs-only", "--max-depth", "1"],
+            timeout=35,
+        )
+        names = {line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()}
+        missing = [name for name in CANONICAL_CATEGORIES if name not in names]
+        if result.returncode == 0 and not missing:
+            return "🟢", "云盘九分类目录：正常"
+        return "🔴", f"云盘九分类目录：缺少 {missing or '读取失败'}"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "🔴", f"云盘九分类目录：检测失败 — {exc}"
+
+
+def check_emby_libraries() -> tuple[str, str]:
+    """Check the nine canonical Emby libraries and required paths."""
+    code = (
+        "import json; from islandbot.app import EMBY_CLIENT; "
+        "from islandbot.categories import CANONICAL_CATEGORIES; "
+        "items=EMBY_CLIENT._request('/Library/VirtualFolders', action='读取媒体库').json(); "
+        "by={str(x.get('Name') or ''):x for x in items if isinstance(x,dict)}; "
+        "missing=[n for n in CANONICAL_CATEGORIES if n not in by]; "
+        "wrong=[n for n in CANONICAL_CATEGORIES if n in by and '/media/'+n not in (by[n].get('Locations') or [])]; "
+        "print('__HEALTH__'+json.dumps({'missing':missing,'wrong':wrong},ensure_ascii=False))"
+    )
+    try:
+        result = run(["docker", "exec", BOT_CONTAINER, "python", "-c", code], timeout=30)
+        for line in result.stdout.splitlines():
+            if line.startswith("__HEALTH__"):
+                data = json.loads(line.removeprefix("__HEALTH__"))
+                missing = data.get("missing") or []
+                wrong = data.get("wrong") or []
+                if not missing and not wrong:
+                    return "🟢", "Emby 九分类：正常"
+                return "🔴", f"Emby 九分类：缺少 {missing or '无'}，路径异常 {wrong or '无'}"
+        return "🟡", "Emby 九分类：读取失败"
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+        return "🔴", f"Emby 九分类：检测失败 — {exc}"
+
+
 def check_upload_block() -> tuple[str, str]:
     """Check cloud upload block status."""
     block = cloud_block_status(BLOCK_FILE)
@@ -253,25 +330,30 @@ def check_upload_block() -> tuple[str, str]:
 def check_orphan_files() -> tuple[str, str]:
     """Detect completed downloads not picked up by MoviePilot.
 
-    An "orphan" is a directory under /opt/media/downloads/complete/ that
-    has existed for over 24 hours.  MoviePilot normally processes files
-    within minutes, so old directories suggest a transfer failure.
+    An "orphan" is an old video file under /opt/media/downloads/complete/.
+    Directory mtimes are ignored because category directories are long-lived.
     """
     complete_dir = DOWNLOADS / "complete"
     if not complete_dir.is_dir():
         return "🟢", "孤儿文件：完成目录不存在"
     orphans = []
     cutoff = time.time() - 24 * 60 * 60
+    video_extensions = {".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov"}
     try:
         for child in complete_dir.iterdir():
-            if child.name.startswith("."):
+            if child.name.startswith(".") or not child.is_dir():
                 continue
-            try:
-                stat = child.stat()
-                if stat.st_mtime < cutoff:
-                    orphans.append(child.name)
-            except OSError:
-                continue
+            old_videos = []
+            for path in child.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in video_extensions:
+                    continue
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        old_videos.append(path)
+                except OSError:
+                    continue
+            if old_videos:
+                orphans.append(f"{child.name}（{len(old_videos)}个视频）")
     except OSError as exc:
         return "🟡", f"孤儿文件：扫描失败 — {exc}"
     if not orphans:
@@ -306,6 +388,7 @@ def build_report() -> str:
         ("", ""),  # separator
         check_rclone_remote("gdrive1"),
         check_rclone_remote("gdrive2"),
+        check_mp_alias(),
         check_rclone_write(),
         check_upload_block(),
         check_pending_retries(),
@@ -315,6 +398,10 @@ def build_report() -> str:
         check_moviepilot(),
         check_aria2(),
         check_emby(),
+        check_media_mount(),
+        check_media_union(),
+        check_emby_libraries(),
+        check_cloud_categories(),
         ("", ""),  # separator
         check_orphan_files(),
     ]
@@ -363,7 +450,7 @@ def main() -> None:
     parser.add_argument(
         "--check",
         choices=[
-            "disk", "gdrive1", "gdrive2", "write", "qbit",
+            "disk", "gdrive1", "gdrive2", "mp", "write", "qbit",
             "moviepilot", "aria2", "emby", "block", "orphan", "retry",
         ],
         help="Run a single check and print the result",
@@ -375,6 +462,7 @@ def main() -> None:
             "disk": check_disk,
             "gdrive1": lambda: check_rclone_remote("gdrive1"),
             "gdrive2": lambda: check_rclone_remote("gdrive2"),
+            "mp": check_mp_alias,
             "write": check_rclone_write,
             "qbit": check_qbittorrent,
             "moviepilot": check_moviepilot,

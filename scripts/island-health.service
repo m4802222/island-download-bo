@@ -1,0 +1,12 @@
+[Unit]
+Description=Island media daily health check
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/media/downloadbot
+ExecStart=/usr/bin/python3 /opt/media/downloadbot/scripts/health-check.py
+TimeoutStartSec=5min
+Nice=10

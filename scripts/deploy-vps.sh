@@ -5,7 +5,7 @@ bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
 repository=m4802222/island-download-bo
-ref=${ISLAND_BOT_REF:-v2.3.0}
+ref=${ISLAND_BOT_REF:-v2.4.0}
 archive_url="https://codeload.github.com/$repository/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
@@ -37,7 +37,7 @@ commit=$(
         python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
 )
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-python3 -m py_compile "$workdir/simplebot.py" "$workdir"/islandbot/*.py
+python3 -m py_compile "$workdir/simplebot.py" "$workdir"/islandbot/*.py "$workdir/scripts/health-check.py"
 (cd "$workdir" && python3 -m unittest discover -s tests -v)
 
 source_items=(simplebot.py Dockerfile)
@@ -77,6 +77,7 @@ restore_category() {
 
 restore_previous() {
     systemctl disable --now moviepilot-rclone-retry.timer >/dev/null 2>&1 || true
+    systemctl disable --now island-health.timer >/dev/null 2>&1 || true
     docker rm -f "$container" >/dev/null 2>&1 || true
     if docker inspect "$backup" >/dev/null 2>&1; then
         docker rename "$backup" "$container"
@@ -224,6 +225,23 @@ install_retry_worker() {
 }
 
 if ! install_retry_worker; then
+    restore_previous
+fi
+
+install_health_worker() {
+    chmod 0755 "$bot_dir/scripts/health-check.py" || return 1
+    install -m 0644 \
+        "$bot_dir/scripts/island-health.service" \
+        /etc/systemd/system/island-health.service || return 1
+    install -m 0644 \
+        "$bot_dir/scripts/island-health.timer" \
+        /etc/systemd/system/island-health.timer || return 1
+    systemctl daemon-reload || return 1
+    /usr/bin/python3 "$bot_dir/scripts/health-check.py" --check disk >/dev/null || return 1
+    systemctl enable --now island-health.timer || return 1
+}
+
+if ! install_health_worker; then
     restore_previous
 fi
 

@@ -30,6 +30,9 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(script=script.name):
                 subprocess.run(["bash", "-n", script], check=True)
 
+        self.assertTrue((ROOT / "scripts" / "island-health.service").is_file())
+        self.assertTrue((ROOT / "scripts" / "island-health.timer").is_file())
+
     def test_deploy_records_revision_time_and_category_backup(self):
         script = (ROOT / "scripts" / "deploy-vps.sh").read_text()
         for required in (
@@ -38,6 +41,8 @@ class DeploymentTests(unittest.TestCase):
             "deployment.json",
             "config/category.yaml",
             ".bak-deploy-",
+            "island-health.timer",
+            "health-check.py",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, script)

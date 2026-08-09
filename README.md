@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.3.0`。
+当前稳定版本：`v2.4.0`。
 
 ## 2.0 重构重点
 
@@ -36,6 +36,8 @@ Google Drive 的媒体流程。
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
 - MoviePilot 的 rclone 上传失败时保留源文件、暂停普通下载；网络错误按 5、15、30、60 分钟递增重试，OAuth 失效不进行高频重试；
   Google Drive 恢复后自动续传并恢复被系统暂停的任务，刷流任务始终不受影响
+- 机器人管理的普通任务连续 30 分钟保持 0% 时自动暂停并通知；AI 问答在后台线程执行，不阻塞下载轮询；可选配置第二个 qBittorrent 做 InfoHash 冲突检查
+- 每天北京时间 08:00 通过 Telegram 检查磁盘、gdrive1/gdrive2、Google Drive 写入、qB、MoviePilot、Aria2、Emby、mediaunion 挂载和九分类媒体库
 - 分类名称直接读取 MoviePilot 的 `category.yaml` 并严格校验“华语 / 日韩 / 海外”
   九分类；qBittorrent 自动补齐对应分类和保存路径，无任务占用时移除旧“欧美”分类
 - 正式九分类文件由仓库 `config/category.yaml` 管理；每次部署先备份 MoviePilot
@@ -72,13 +74,13 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.3.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
 部署脚本会先执行编译和测试，保留上一版源码用于失败回滚，并以目录方式将
 MoviePilot 的 rclone 配置挂载到 `/rclone:rw`，避免 OAuth 刷新后容器仍读取旧文件。
-部署完成后还会安装上传恢复定时器；它只重试源文件仍存在的 rclone 上传失败记录。
+部署完成后还会安装上传恢复定时器和每日健康检查定时器；上传恢复只重试源文件仍存在的 rclone 上传失败记录。
 MoviePilot 已移动源文件时会继续阻止新普通下载，直到成功记录与云盘实时文件大小通过验证；
 不会把识别失败或旧成功记录误判为本次上传成功。
 
@@ -104,6 +106,9 @@ VPS 的 `.env` 中，不会显示在 Telegram 消息里。
 `QBIT_SAVE_PATH` 固定为 `/downloads/complete/islandbot`。`AUTO_CLEANUP_COMPLETED`
 开启后，仅在 MoviePilot 成功记录、历史大小、qB 文件大小和云盘实时大小四者一致时清理普通下载任务；
 刷流分类和刷流标签不会自动删除。
+
+如需检查另一个刷流 qBittorrent 的 InfoHash 冲突，请在 VPS 的机器人 `.env` 中填写
+`QBIT2_URL`、`QBIT2_USERNAME`、`QBIT2_PASSWORD`；留空则不启用该检查。
 
 ## 测试
 

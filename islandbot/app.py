@@ -495,10 +495,6 @@ def google_drive_existing(media_title):
                 SETTINGS.drive_remote,
                 "--recursive",
                 "--files-only",
-                # Only scan subdirectories whose name starts with the exact title;
-                # avoids a full-drive recursive listing for every deduplication check.
-                "--include", f"**/{identity.title}/**",
-                "--include", f"**/{identity.title} (*/**",
             ],
             capture_output=True,
             text=True,

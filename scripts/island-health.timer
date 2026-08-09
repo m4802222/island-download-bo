@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Island media health check daily at 08:00
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
