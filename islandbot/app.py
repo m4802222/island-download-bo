@@ -43,6 +43,7 @@ from .services.qbit_lifecycle import QBitLifecycle
 from .services.drive import DriveService
 from .services.quark import QuarkService
 from .services.transfer import TransferService
+from .services.telegram_ui import TelegramUI
 from .config import Settings, explicit_web_port
 from .parsing import (
     extract_magnet,
@@ -149,6 +150,14 @@ ARIA2_CLIENT = Aria2Client(ARIA2_URL, ARIA2_SECRET)
 QAS_CLIENT = QasClient(QAS_URL, QAS_USER, QAS_PASSWORD)
 QBIT_CLIENT = QBitClient(QBIT_URL, QBIT_USER, QBIT_PASSWORD)
 EMBY_CLIENT = EmbyClient(SETTINGS.emby_url, SETTINGS.emby_api_key)
+TELEGRAM_UI = TelegramUI(
+    lambda method, data: telegram(method, data),
+    EXPIRING,
+    EXPIRING_LOCK,
+    EXPIRY_STORE,
+    lambda: CATEGORIES,
+    lambda: MAX_ACTIVE_DOWNLOADS,
+)
 NORMALIZER = EpisodeNormalizer(
     QBIT_CLIENT,
     RESOLVER,
@@ -794,87 +803,45 @@ def telegram(method, data):
 
 
 def send(chat_id, text, keyboard=None):
-    # Hermes submits jobs through a local file inbox.  Those jobs must not
-    # produce a second Telegram conversation from IslandDownloadBot.
-    if not chat_id:
-        return {"result": {}}
-    payload = {"chat_id": chat_id, "text": text}
-    if keyboard:
-        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard}, ensure_ascii=False)
-    return telegram("sendMessage", payload)
+    TELEGRAM_UI.telegram_call = lambda method, data: telegram(method, data)
+    return TELEGRAM_UI.send(chat_id, text, keyboard)
 
 
 def send_temporary(chat_id, text, lifetime_seconds=300):
-    if not chat_id:
-        return
-    response = send(chat_id, text)
-    message_id = response.get("result", {}).get("message_id")
-    if message_id:
-        with EXPIRING_LOCK:
-            EXPIRING.append({"chat_id": chat_id, "message_id": message_id, "delete_at": time.time() + lifetime_seconds})
-            EXPIRY_STORE.save(EXPIRING)
+    TELEGRAM_UI.telegram_call = lambda method, data: telegram(method, data)
+    TELEGRAM_UI.expiring = EXPIRING
+    TELEGRAM_UI.expiring_lock = EXPIRING_LOCK
+    TELEGRAM_UI.expiry_store = EXPIRY_STORE
+    return TELEGRAM_UI.send_temporary(chat_id, text, lifetime_seconds)
 
 
 def delete_expired_messages():
-    now = time.time()
-    with EXPIRING_LOCK:
-        snapshot = list(EXPIRING)
-    remaining = []
-    for item in snapshot:
-        if item["delete_at"] > now:
-            remaining.append(item)
-            continue
-        try:
-            telegram("deleteMessage", {"chat_id": item["chat_id"], "message_id": item["message_id"]})
-        except Exception as exc:
-            print("delete-expired-message error:", exc, flush=True)
-    if len(remaining) != len(snapshot):
-        with EXPIRING_LOCK:
-            EXPIRING[:] = remaining
-            EXPIRY_STORE.save(EXPIRING)
+    TELEGRAM_UI.telegram_call = lambda method, data: telegram(method, data)
+    TELEGRAM_UI.expiring = EXPIRING
+    TELEGRAM_UI.expiring_lock = EXPIRING_LOCK
+    TELEGRAM_UI.expiry_store = EXPIRY_STORE
+    TELEGRAM_UI.delete_expired_messages()
 
 
 def answer(callback_id, text=None):
-    data = {"callback_query_id": callback_id}
-    if text:
-        data["text"] = text
-    try:
-        telegram("answerCallbackQuery", data)
-    except RuntimeError as exc:
-        # Telegram callback buttons expire quickly.  A user can legitimately
-        # click an old bot card after it has been sitting in the chat for a
-        # while; that must not abort the update loop or make newer buttons
-        # appear unresponsive.
-        message = str(exc).lower()
-        expired = (
-            "query is too old" in message
-            or "response timeout expired" in message
-            or "query id is invalid" in message
-        )
-        if not expired:
-            raise
-        print("telegram callback expired; continuing", flush=True)
+    TELEGRAM_UI.telegram_call = lambda method, data: telegram(method, data)
+    TELEGRAM_UI.answer(callback_id, text)
 
 
 def home_keyboard():
-    return [
-        [{"text": "👤 开号", "callback_data": "account:create"}, {"text": "📋 我的任务", "callback_data": "home:tasks"}],
-        [{"text": "🖥 状态与设置", "callback_data": "home:server"}],
-    ]
+    return TELEGRAM_UI.home_keyboard()
 
 
 def category_keyboard():
-    rows = []
-    for index in range(0, len(CATEGORIES), 3):
-        rows.append([{"text": item, "callback_data": f"category:{item}"} for item in CATEGORIES[index:index + 3]])
-    rows.append([{"text": "🤖 智能分类", "callback_data": "category:__auto__"}])
-    rows.append([{"text": "取消", "callback_data": "home:home"}])
-    return rows
+    TELEGRAM_UI.categories = lambda: CATEGORIES
+    return TELEGRAM_UI.category_keyboard()
 
 
 def home(chat_id, first_name=""):
-    greeting = f"你好，{first_name}。" if first_name else "你好。"
-    send(chat_id, f"{greeting}\n\nIsland Download\n发送 magnet、.torrent 或夸克分享链接。\n系统会智能分类，最多同时下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n也可以直接发送中文问题给 AI 助手。", home_keyboard())
+    TELEGRAM_UI.telegram_call = lambda method, data: telegram(method, data)
+    TELEGRAM_UI.categories = lambda: CATEGORIES
+    TELEGRAM_UI.max_active_downloads = lambda: MAX_ACTIVE_DOWNLOADS
+    return TELEGRAM_UI.home(chat_id, first_name)
 
 
 def task_list():
