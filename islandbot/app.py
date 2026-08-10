@@ -1,7 +1,5 @@
 import json
 import shutil
-import sqlite3
-import subprocess
 import threading
 import time
 import re
@@ -42,9 +40,9 @@ from .retry import cloud_block_status
 from .storage import IdentityStore, JsonStore
 from .services.normalizer import EpisodeNormalizer
 from .services.qbit_lifecycle import QBitLifecycle
-from .transfer_verification import (
-    load_successful_transfer_proofs,
-)
+from .services.drive import DriveService
+from .services.quark import QuarkService
+from .services.transfer import TransferService
 from .config import Settings, explicit_web_port
 from .parsing import (
     extract_magnet,
@@ -54,6 +52,8 @@ from .parsing import (
 )
 
 SETTINGS = Settings.from_env()
+DRIVE_SERVICE = DriveService(SETTINGS.rclone_config, SETTINGS.drive_remote)
+TRANSFER_SERVICE = TransferService(SETTINGS.moviepilot_db)
 TOKEN = SETTINGS.bot_token
 OWNER = SETTINGS.owner_id
 QBIT_URL = SETTINGS.qbit_url
@@ -268,6 +268,14 @@ def qas_open(path, payload=None, timeout=45):
     return QAS_CLIENT.request(path, payload, timeout)
 
 
+QUARK_SERVICE = QuarkService(
+    qas_open,
+    QUARK_SAVE_PATH,
+    lambda media_title: moviepilot_existing(media_title),
+    lambda media_title: google_drive_existing(media_title),
+)
+
+
 def media_folder_name(title):
     """Compatibility wrapper around the domain title normalizer."""
     try:
@@ -394,52 +402,11 @@ def confirm_quark_download(chat_id, share_url, media_title):
 
 
 def qas_task(share_url, task_name, media_title=None, pattern=""):
-    # QAS's Aria2 plugin flattens the source tree when save_path is set. Put a
-    # title in the destination path so MoviePilot sees e.g. "剧名 (年份)/S01E02".
-    aria_save_path = "incoming"
-    if media_title:
-        identity = parse_identity_label(media_title)
-        if not identity:
-            raise RuntimeError("媒体身份格式异常，未提交 QAS")
-        # Keep the season in the first path component. The Aria2 completion
-        # hook uses this component when it prefixes bare files such as 01.mkv.
-        aria_save_path = f"incoming/{identity.task_label}"
-    return {
-        "taskname": task_name,
-        "shareurl": share_url,
-        # Each request gets its own Quark temporary folder. That prevents a
-        # repeat share from being mistaken for an already-processed task.
-        "savepath": f"{QUARK_SAVE_PATH}/{task_name}",
-        "pattern": pattern,
-        "replace": "",
-        "addition": {
-            "aria2": {
-                "auto_download": True,
-                "download_subdir": True,
-                "save_path": aria_save_path,
-                "pause": False,
-            }
-        },
-    }
+    return QUARK_SERVICE.task(share_url, task_name, media_title, pattern)
 
 
 def qas_share_folders(share_url, stoken=None):
-    """Return the first-level folders of a shared Quark link."""
-    payload = {"shareurl": share_url}
-    if stoken:
-        payload["stoken"] = stoken
-    response = qas_open("/get_share_detail", payload)
-    payload = response.json()
-    if not payload.get("success"):
-        error = payload.get("data", {}).get("error") or payload.get("message") or "夸克链接解析失败"
-        raise RuntimeError(error)
-    entries = payload.get("data", {}).get("list", [])
-    folders = [
-        {"fid": item["fid"], "name": item["file_name"]}
-        for item in entries
-        if item.get("dir") and item.get("fid") and item.get("file_name")
-    ]
-    return folders, payload.get("data", {}).get("stoken")
+    return QUARK_SERVICE.share_folders(share_url, stoken)
 
 
 def episode_key(text, default_season=None):
@@ -451,109 +418,21 @@ def episode_keys(text, default_season=None):
 
 
 def qas_share_video_files(share_url):
-    """Return direct video file names in the chosen Quark directory."""
-    response = qas_open("/get_share_detail", {"shareurl": share_url})
-    payload = response.json()
-    if not payload.get("success"):
-        error = payload.get("data", {}).get("error") or payload.get("message") or "夸克目录读取失败"
-        raise RuntimeError(error)
-    return [
-        item["file_name"]
-        for item in payload.get("data", {}).get("list", [])
-        if not item.get("dir")
-        and item.get("file_name", "").lower().endswith(VIDEO_EXTENSIONS)
-    ]
+    return QUARK_SERVICE.share_video_files(share_url)
 
 
 def moviepilot_existing(media_title):
-    """Return successful MoviePilot transfer paths for one canonical title."""
-    database = SETTINGS.moviepilot_db
-    if not database.is_file():
-        raise RuntimeError("MoviePilot 整理历史不可读取，已停止提交下载以防重复")
-    identity = parse_identity_label(media_title)
-    if not identity:
-        raise RuntimeError("媒体身份格式异常，未检查 MoviePilot 历史")
-    title = identity.title
-    try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-        rows = connection.execute(
-            "SELECT title, episodes, dest, files FROM transferhistory "
-            "WHERE status = 1 AND (title LIKE ? OR dest LIKE ?)",
-            (f"%{title}%", f"%{title}%"),
-        ).fetchall()
-        connection.close()
-    except sqlite3.Error as exc:
-        raise RuntimeError(f"MoviePilot 整理历史读取失败，未提交下载：{exc}")
-    paths = []
-    for row in rows:
-        for value in row:
-            if value:
-                paths.append(str(value))
-    return paths, bool(rows)
+    """Compatibility wrapper for MoviePilot history lookup."""
+    return TRANSFER_SERVICE.moviepilot_existing(media_title)
 
 
 def google_drive_existing(media_title):
-    """Read the real Google Drive library instead of trusting history alone."""
-    identity = parse_identity_label(media_title)
-    if not identity:
-        raise RuntimeError("媒体身份格式异常，未检查 Google Drive")
-    try:
-        result = subprocess.run(
-            [
-                "rclone",
-                "--config",
-                str(SETTINGS.rclone_config),
-                "lsf",
-                SETTINGS.drive_remote,
-                "--recursive",
-                "--files-only",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Google Drive 媒体库读取失败，未提交下载：{exc}")
-    if result.returncode != 0:
-        raise RuntimeError(f"Google Drive 媒体库读取失败，未提交下载：{result.stderr.strip()[:120]}")
-    matched = []
-    for path in result.stdout.splitlines():
-        components = path.split("/")
-        if any(
-            component == identity.title
-            or component.startswith(f"{identity.title} (")
-            for component in components
-        ):
-            matched.append(path)
-    return matched, bool(matched)
+    """Compatibility wrapper for the live Google Drive library lookup."""
+    return DRIVE_SERVICE.existing(media_title)
 
 
 def quark_missing_plan(share_url, media_title):
-    """Build a QAS include regex using the actual Drive library as truth."""
-    files = qas_share_video_files(share_url)
-    if not files:
-        return "", 0, 0
-    identity = parse_identity_label(media_title)
-    if not identity:
-        raise RuntimeError("媒体身份格式异常，未进行缺集判断")
-    source_seasons = {
-        season
-        for name in files
-        for season in explicit_seasons(name)
-    }
-    if source_seasons and source_seasons != {identity.season}:
-        seasons = "、".join(f"第 {season} 季" for season in sorted(source_seasons))
-        raise RuntimeError(
-            f"分享文件明确标记为 {seasons}，但当前确认身份是第 {identity.season} 季。"
-            "已停止下载，请修改媒体身份后重试。"
-        )
-    history_paths, _ = moviepilot_existing(media_title)
-    drive_paths, _ = google_drive_existing(media_title)
-    plan = missing_plan(files, [*history_paths, *drive_paths], identity)
-    if plan.complete:
-        return None, plan.total, plan.skipped
-    return plan.include_regex, plan.total, plan.skipped
+    return QUARK_SERVICE.missing_plan(share_url, media_title)
 
 
 def qas_download_choices(share_url, max_depth=5):
@@ -563,29 +442,11 @@ def qas_download_choices(share_url, max_depth=5):
     "Season 1 (HQ)" / "Season 1 (SDR)". The former is a wrapper, not a
     download choice. Keep its title as a hint for MoviePilot.
     """
-    current_url = share_url
-    title_hint = None
-    stoken = None
-    for _ in range(max_depth):
-        folders, stoken = qas_share_folders(current_url, stoken)
-        if len(folders) != 1:
-            return current_url, folders, title_hint
-        wrapper = folders[0]
-        inferred = folder_media_title(wrapper["name"])
-        if inferred:
-            title_hint = inferred
-        current_url = selected_share_url(current_url, wrapper)
-    # Never choose an arbitrary nested folder if the hierarchy is unusually
-    # deep; let the user see the final folder instead.
-    folders, _ = qas_share_folders(current_url, stoken)
-    return current_url, folders, title_hint
+    return QUARK_SERVICE.download_choices(share_url, folder_media_title, max_depth)
 
 
 def selected_share_url(share_url, folder):
-    """QAS supports a share URL with a folder fid in its fragment."""
-    base = share_url.split("#", 1)[0]
-    name = urllib.parse.quote(folder["name"], safe="")
-    return f"{base}#/list/share/{folder['fid']}-{name}"
+    return QUARK_SERVICE.selected_share_url(share_url, folder)
 
 
 def enqueue_quark_task(chat_id, share_url, media_title=None):
@@ -1068,27 +929,7 @@ QBIT_LIFECYCLE = QBitLifecycle(
 
 def google_drive_capacity():
     """Read the configured Google Drive quota through MoviePilot's rclone remote."""
-    try:
-        result = subprocess.run(
-            ["rclone", "--config", str(SETTINGS.rclone_config), "about", SETTINGS.drive_remote.split(":", 1)[0] + ":"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "rclone about failed")
-        values = {}
-        for line in result.stdout.splitlines():
-            if ":" in line:
-                key, value = line.split(":", 1)
-                values[key.strip()] = value.strip()
-        if not values.get("Total"):
-            raise RuntimeError("未返回配额")
-        return f"总 {values.get('Total', '—')} · 已用 {values.get('Used', '—')} · 可用 {values.get('Free', '—')}"
-    except Exception as exc:
-        print("google-drive-capacity error:", exc, flush=True)
-        return "暂时无法读取"
+    return DRIVE_SERVICE.capacity()
 
 
 def moviepilot_transfer_now():
@@ -1809,50 +1650,12 @@ def watch_completed():
 
 def moviepilot_successful_proofs(candidates):
     """Return MoviePilot's latest successful source/destination metadata."""
-
-    return load_successful_transfer_proofs(
-        SETTINGS.moviepilot_db,
-        set(candidates),
-    )
+    return TRANSFER_SERVICE.successful_proofs(candidates)
 
 
 def rclone_destination_size(destination):
     """Return the live byte size for one MoviePilot rclone destination."""
-
-    remote = SETTINGS.drive_remote.split(":", 1)[0] + ":"
-    try:
-        result = subprocess.run(
-            [
-                "rclone",
-                "--config",
-                str(SETTINGS.rclone_config),
-                "lsjson",
-                "--stat",
-                "--no-mimetype",
-                "--no-modtime",
-                f"{remote}{destination}",
-                "--contimeout",
-                "10s",
-                "--timeout",
-                "20s",
-                "--retries",
-                "1",
-                "--low-level-retries",
-                "1",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0:
-            return None
-        item = json.loads(result.stdout)
-        if not isinstance(item, dict) or item.get("IsDir") is not False:
-            return None
-        return int(item.get("Size"))
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
-        return None
+    return DRIVE_SERVICE.destination_size(destination)
 
 
 def cleanup_transferred_qbit_tasks():
