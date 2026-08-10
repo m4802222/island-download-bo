@@ -27,7 +27,6 @@ from .categories import (
     load_moviepilot_categories,
     qbit_category_paths,
 )
-from .cleanup import is_brush_task, safe_to_cleanup, selected_video_sizes
 from .library import missing_plan
 from .media import (
     VIDEO_EXTENSIONS,
@@ -42,9 +41,9 @@ from .resolver import MediaResolver, ResolutionError
 from .retry import cloud_block_status
 from .storage import IdentityStore, JsonStore
 from .services.normalizer import EpisodeNormalizer
+from .services.qbit_lifecycle import QBitLifecycle
 from .transfer_verification import (
     load_successful_transfer_proofs,
-    verified_transfer_sources,
 )
 from .config import Settings, explicit_web_port
 from .parsing import (
@@ -1045,20 +1044,26 @@ def save_blocked():
     BLOCKED_STORE.save(list(BLOCKED))
 
 
-def file_size(item):
-    if "amount_left" in item:
-        return int(item.get("amount_left") or 0)
-    return int(item.get("total_size") or item.get("size") or 0)
-
-
-def has_enough_space(item, free=None):
-    """Return whether the next download fits, with a fixed safety reserve."""
-    size = file_size(item)
-    if size <= 0:
-        # A magnet can need a short metadata phase before qBittorrent knows size.
-        return True, size, free if free is not None else shutil.disk_usage(SETTINGS.downloads_dir).free
-    free = free if free is not None else shutil.disk_usage(SETTINGS.downloads_dir).free
-    return size <= max(0, free - RESERVE_GIB * GIB), size, free
+QBIT_LIFECYCLE = QBitLifecycle(
+    QBIT_CLIENT,
+    task_list,
+    lambda text: send(OWNER, text),
+    OWNER,
+    QUEUE,
+    BLOCKED,
+    save_queue,
+    save_blocked,
+    QUEUE_READY,
+    MAX_ACTIVE_DOWNLOADS,
+    RESERVE_GIB,
+    SETTINGS.downloads_dir,
+    CLOUD_UPLOAD_BLOCK_FILE,
+    SETTINGS.auto_cleanup_completed,
+    SETTINGS.cleanup_interval_seconds,
+    lambda candidates: moviepilot_successful_proofs(candidates),
+    lambda destination: rclone_destination_size(destination),
+    stall_threshold=STALL_THRESHOLD,
+)
 
 
 def google_drive_capacity():
@@ -1097,101 +1102,18 @@ def moviepilot_transfer_now():
 
 
 def run_queue():
-    """Keep up to MAX_ACTIVE_DOWNLOADS bot tasks downloading in queue order."""
+    """Compatibility wrapper for the extracted qB lifecycle service."""
     global QUEUE_READY
-    tasks = task_list()
-    task_by_hash = {item["hash"]: item for item in tasks}
-
-    # First upgrade: put pre-existing unfinished bot tasks into the same queue.
-    if not QUEUE_READY:
-        QUEUE.extend(item["hash"] for item in sorted(tasks, key=lambda item: item.get("added_on", 0)) if item.get("progress", 0) < 1)
-        QUEUE_READY = True
-
-    # Finished or deleted tasks no longer block the next download.
-    QUEUE[:] = [task_hash for task_hash in QUEUE if task_hash in task_by_hash and task_by_hash[task_hash].get("progress", 0) < 1]
-    save_queue()
-    stale_blocked = BLOCKED - set(QUEUE)
-    if stale_blocked:
-        BLOCKED.difference_update(stale_blocked)
-        save_blocked()
-    if not QUEUE:
-        return
-
-    # A retained MoviePilot upload failure must be cleared before ordinary
-    # downloads consume more disk. Brush tasks are always outside this gate.
-    cloud_block = cloud_block_status(CLOUD_UPLOAD_BLOCK_FILE)
-    if cloud_block.get("active"):
-        for task_hash in QUEUE:
-            item = task_by_hash.get(task_hash)
-            if (
-                item
-                and not is_brush_task(item)
-                and item.get("state")
-                not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}
-            ):
-                qbit_action("pause", task_hash)
-        return
-
-    active_hashes = QUEUE[:MAX_ACTIVE_DOWNLOADS]
-    # Every later item stays paused, even after a container restart.
-    for task_hash in QUEUE[MAX_ACTIVE_DOWNLOADS:]:
-        item = task_by_hash.get(task_hash)
-        if item and item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-            qbit_action("pause", task_hash)
-    free = shutil.disk_usage(SETTINGS.downloads_dir).free
-    available = max(0, free - RESERVE_GIB * GIB)
-    for task_hash in active_hashes:
-        item = task_by_hash.get(task_hash)
-        if not item:
-            continue
-        fits, size, _ = has_enough_space(item, available + RESERVE_GIB * GIB)
-        if not fits:
-            if item.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-                qbit_action("pause", task_hash)
-            if task_hash not in BLOCKED:
-                BLOCKED.add(task_hash)
-                save_blocked()
-                send(OWNER, f"⚠️ 队列暂停：空间不足\n\n{item.get('name', '')[:55]}\n剩余需下载：{size / GIB:.1f} GB\n当前可用：{free / GIB:.1f} GB\n安全预留：{RESERVE_GIB} GB\n\n等待 MoviePilot 上传并清理文件后，将自动继续。")
-            continue
-        available = max(0, available - size)
-        if task_hash in BLOCKED:
-            BLOCKED.remove(task_hash)
-            save_blocked()
-        if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-            qbit_action("resume", task_hash)
-
-    # --- Stall detection: auto-pause tasks stuck at 0% for over 30 min ---
-    now_mono = time.monotonic()
-    for task_hash in active_hashes:
-        item = task_by_hash.get(task_hash)
-        if not item:
-            continue
-        if float(item.get("progress") or 0) > 0:
-            # Making progress; clear any stall tracking.
-            STALL_FIRST_SEEN.pop(task_hash, None)
-            STALL_NOTIFIED.discard(task_hash)
-            continue
-        if item.get("state") in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}:
-            continue
-        if task_hash not in STALL_FIRST_SEEN:
-            STALL_FIRST_SEEN[task_hash] = now_mono
-            continue
-        if now_mono - STALL_FIRST_SEEN[task_hash] >= STALL_THRESHOLD:
-            qbit_action("pause", task_hash)
-            if task_hash not in STALL_NOTIFIED:
-                STALL_NOTIFIED.add(task_hash)
-                send(
-                    OWNER,
-                    f"⚠️ 任务卡死已自动暂停\n\n"
-                    f"{item.get('name', '')[:55]}\n"
-                    f"已停留 0% 超过 {STALL_THRESHOLD // 60} 分钟。\n\n"
-                    "建议在「我的任务」中删除并换种。",
-                )
-    # Clean up stale entries for tasks no longer in the queue.
-    stale_stall = set(STALL_FIRST_SEEN) - set(QUEUE)
-    for task_hash in stale_stall:
-        STALL_FIRST_SEEN.pop(task_hash, None)
-        STALL_NOTIFIED.discard(task_hash)
+    QBIT_LIFECYCLE.qbit = QBIT_CLIENT
+    QBIT_LIFECYCLE.tasks_loader = task_list
+    QBIT_LIFECYCLE.queue = QUEUE
+    QBIT_LIFECYCLE.blocked = BLOCKED
+    QBIT_LIFECYCLE.queue_ready = QUEUE_READY
+    QBIT_LIFECYCLE.send_owner = lambda text: send(OWNER, text)
+    QBIT_LIFECYCLE.max_active_downloads = MAX_ACTIVE_DOWNLOADS
+    QBIT_LIFECYCLE.reserve_gib = RESERVE_GIB
+    QBIT_LIFECYCLE.run_queue()
+    QUEUE_READY = QBIT_LIFECYCLE.queue_ready
 
 
 def show_tasks(chat_id):
@@ -1934,85 +1856,16 @@ def rclone_destination_size(destination):
 
 
 def cleanup_transferred_qbit_tasks():
-    """Delete source data only after MoviePilot confirms every video file."""
-
+    """Compatibility wrapper for verified qB cleanup."""
     global LAST_QBIT_CLEANUP
-    if not SETTINGS.auto_cleanup_completed:
-        return
-    now = time.monotonic()
-    if now - LAST_QBIT_CLEANUP < SETTINGS.cleanup_interval_seconds:
-        return
-    LAST_QBIT_CLEANUP = now
-
-    if cloud_block_status(CLOUD_UPLOAD_BLOCK_FILE).get("active"):
-        return
-
-    try:
-        tasks = QBIT_CLIENT.request("/api/v2/torrents/info").json()
-    except Exception as exc:
-        print(f"qbit-cleanup check failed: {exc}", flush=True)
-        return
-
-    candidates = []
-    expected_sizes = {}
-    task_files = {}
-    for task in tasks if isinstance(tasks, list) else []:
-        if float(task.get("progress") or 0) < 1 or is_brush_task(task):
-            continue
-        task_hash = str(task.get("hash") or "")
-        if not task_hash:
-            continue
-        try:
-            files = QBIT_CLIENT.files(task_hash)
-        except Exception as exc:
-            print(f"qbit-cleanup files {task_hash[:12]} failed: {exc}", flush=True)
-            continue
-        sizes = selected_video_sizes(task, files)
-        if not sizes or not safe_to_cleanup(task, files, set(sizes)):
-            continue
-        task_files[task_hash] = files
-        candidates.append(task)
-        expected_sizes.update(sizes)
-
-    if not candidates:
-        return
-    try:
-        proofs = moviepilot_successful_proofs(expected_sizes)
-        sources, rejected = verified_transfer_sources(
-            proofs,
-            rclone_destination_size,
-            expected_sizes,
-        )
-    except Exception as exc:
-        print(f"qbit-cleanup verification failed: {exc}", flush=True)
-        return
-
-    missing = set(expected_sizes) - set(proofs)
-    if missing or rejected:
-        print(
-            "qbit-cleanup retained unverified files: "
-            f"missing_history={len(missing)} rejected={len(rejected)}",
-            flush=True,
-        )
-
-    removed = []
-    for task in candidates:
-        task_hash = str(task.get("hash") or "")
-        try:
-            files = task_files[task_hash]
-            if not safe_to_cleanup(task, files, sources):
-                continue
-            QBIT_CLIENT.action("delete", task_hash, delete_files=True)
-            removed.append(str(task.get("name") or task_hash[:12]))
-        except Exception as exc:
-            print(f"qbit-cleanup task {task_hash[:12]} failed: {exc}", flush=True)
-
-    if removed:
-        print(
-            f"qbit-cleanup removed {len(removed)} transferred task(s): "
-            + " | ".join(removed),
-            flush=True,
-        )
+    QBIT_LIFECYCLE.qbit = QBIT_CLIENT
+    QBIT_LIFECYCLE.auto_cleanup_completed = SETTINGS.auto_cleanup_completed
+    QBIT_LIFECYCLE.cleanup_interval_seconds = SETTINGS.cleanup_interval_seconds
+    QBIT_LIFECYCLE.last_cleanup = LAST_QBIT_CLEANUP
+    QBIT_LIFECYCLE.successful_proofs = lambda candidates: moviepilot_successful_proofs(candidates)
+    QBIT_LIFECYCLE.destination_size = lambda destination: rclone_destination_size(destination)
+    QBIT_LIFECYCLE.cleanup_transferred()
+    LAST_QBIT_CLEANUP = QBIT_LIFECYCLE.last_cleanup
 
 
 def watch_aria2_completed():

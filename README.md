@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.4.6`。
+当前稳定版本：`v2.4.7`。
 
 ## 2.0 重构重点
 
@@ -71,6 +71,7 @@ Google Drive 的媒体流程。
 - `islandbot/clients.py`：Telegram、Aria2、QAS、MoviePilot 适配器。
 - `islandbot/parsing.py`：Telegram 资源帖、夸克和磁力链接解析。
 - `islandbot/services/normalizer.py`：已完成任务的裸集数规范化和 staging 晋级。
+- `islandbot/services/qbit_lifecycle.py`：qB 队列限流、卡死暂停和验证后清理。
 - `islandbot/app.py`：业务编排与交互入口。
 - `tests/`：历史故障回归测试。
 
@@ -81,7 +82,7 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.6/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.7/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
