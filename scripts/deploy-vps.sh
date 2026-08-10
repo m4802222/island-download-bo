@@ -118,7 +118,7 @@ docker run --rm \
     "$image" \
     python -c '
 import islandbot.app
-from islandbot.config import SETTINGS
+from islandbot.app import SETTINGS
 if SETTINGS.telegram_ui_engine == "aiogram_dialog":
     import aiogram, aiogram_dialog
     print("AIOGRAM_UI_DEPS_OK", aiogram.__version__)
