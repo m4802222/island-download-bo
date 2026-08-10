@@ -52,7 +52,7 @@ class SeenMigrationTests(unittest.TestCase):
     """Test the SEEN format migration from list to timestamped dict."""
 
     def _migrate(self, raw):
-        """Reproduce the migration logic from app.py module init."""
+        """Reproduce the migration logic from runtime.py module init."""
         import time
         if isinstance(raw, list):
             return {h: time.time() for h in raw if isinstance(h, str)}
