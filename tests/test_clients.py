@@ -110,6 +110,20 @@ class QBitClientTests(unittest.TestCase):
             {"hash": "abc", "oldPath": "08.mkv", "newPath": "Show.S01E08.mkv"},
         )
 
+    def test_set_location_uses_qbittorrent_endpoint(self):
+        client = QBitClient("http://qbit:8080", "admin", "secret")
+        client.cookie = "SID=test"
+        with patch(
+            "islandbot.clients.fetch",
+            return_value=Response(200, b"", {}),
+        ) as mocked:
+            client.set_location("abc", "/downloads/complete/islandbot")
+        self.assertIn("/api/v2/torrents/setLocation", mocked.call_args.args[0])
+        self.assertEqual(
+            mocked.call_args.kwargs["form"],
+            {"hashes": "abc", "location": "/downloads/complete/islandbot"},
+        )
+
     def test_unauthorized_request_relogs_once(self):
         client = QBitClient("http://qbit:8080", "admin", "secret")
         client.cookie = "SID=expired"

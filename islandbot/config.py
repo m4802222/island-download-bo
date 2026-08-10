@@ -76,6 +76,7 @@ class Settings:
     data_dir: Path
     downloads_dir: Path
     qbit_save_path: str
+    qbit_staging_path: str
     moviepilot_db: Path
     moviepilot_category_file: Path
     rclone_config: Path
@@ -116,6 +117,9 @@ class Settings:
             downloads_dir=Path(os.environ.get("DOWNLOADS_DIR", "/downloads")),
             qbit_save_path=os.environ.get(
                 "QBIT_SAVE_PATH", "/downloads/complete/islandbot"
+            ).rstrip("/"),
+            qbit_staging_path=os.environ.get(
+                "QBIT_STAGING_PATH", "/downloads/incoming/islandbot"
             ).rstrip("/"),
             moviepilot_db=Path(os.environ.get("MOVIEPILOT_DB", "/moviepilot-config/user.db")),
             moviepilot_category_file=Path(

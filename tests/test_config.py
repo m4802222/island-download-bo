@@ -34,6 +34,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.min_free_gib, 5)
         self.assertEqual(settings.max_active_downloads, 3)
         self.assertEqual(settings.qbit_save_path, "/downloads/complete/islandbot")
+        self.assertEqual(settings.qbit_staging_path, "/downloads/incoming/islandbot")
         self.assertEqual(
             settings.moviepilot_category_file,
             Path("/moviepilot-config/category.yaml"),

@@ -1,4 +1,5 @@
 import json
+import posixpath
 import shutil
 import sqlite3
 import subprocess
@@ -43,6 +44,7 @@ from .media import (
 from .resolver import MediaResolver, ResolutionError
 from .retry import cloud_block_status
 from .storage import IdentityStore, JsonStore
+from .staging import is_ready_path, ready_save_path
 from .transfer_verification import (
     load_successful_transfer_proofs,
     verified_transfer_sources,
@@ -72,6 +74,7 @@ ARIA2_SECRET = SETTINGS.aria2_secret
 MOVIEPILOT_URL = SETTINGS.moviepilot_url
 MOVIEPILOT_TOKEN = SETTINGS.moviepilot_token
 QBIT_SAVE_PATH = SETTINGS.qbit_save_path
+QBIT_STAGING_PATH = SETTINGS.qbit_staging_path
 OFFSET = 0
 PENDING = {}
 
@@ -828,7 +831,7 @@ def qbit_add_torrent_file(filename, content, category):
         filename,
         content,
         category,
-        download_path(category, QBIT_SAVE_PATH, CATEGORIES),
+        download_path(category, QBIT_STAGING_PATH, CATEGORIES),
     )
 
 
@@ -841,7 +844,7 @@ def synchronize_media_categories():
         required=True,
     )
     result = QBIT_CLIENT.sync_categories(
-        qbit_category_paths(categories, QBIT_SAVE_PATH),
+        qbit_category_paths(categories, QBIT_STAGING_PATH),
         set(LEGACY_QBIT_CATEGORIES),
     )
     CATEGORIES[:] = categories
@@ -1031,18 +1034,19 @@ def _release_title_probe(value):
 def _completed_task_root(item):
     """Return a bot-owned qBittorrent content directory, if it is visible."""
 
-    base = Path(QBIT_SAVE_PATH)
-    raw = item.get("content_path") or item.get("save_path") or str(base)
+    roots = {
+        Path(QBIT_SAVE_PATH).parent,
+        Path(QBIT_STAGING_PATH).parent,
+    }
+    raw = item.get("content_path") or item.get("save_path") or QBIT_SAVE_PATH
     root = Path(str(raw))
     if root.is_file():
         root = root.parent
-    try:
-        root.relative_to(base)
-    except ValueError:
+    if not any(root == base or base in root.parents for base in roots):
         return None
-    if root == base:
+    if any(root == base for base in roots):
         name = str(item.get("name") or "").strip()
-        candidate = base / name if name else None
+        candidate = root / name if name else None
         if not candidate or not candidate.is_dir():
             return None
         root = candidate
@@ -1142,6 +1146,90 @@ def normalize_completed_episode_files(tasks):
             existing_paths.add(target_path)
             print(f"episode-normalizer renamed {old_name} -> {Path(target_path).name}", flush=True)
     return renamed
+
+
+def _task_save_path(item):
+    """Return qBittorrent's directory for one task."""
+
+    save_path = str(item.get("save_path") or "").strip()
+    if save_path:
+        return save_path
+    content_path = str(item.get("content_path") or "").strip()
+    return str(Path(content_path).parent) if content_path else ""
+
+
+def _task_info(torrent_hash):
+    query = urllib.parse.urlencode({"hash": torrent_hash})
+    tasks = QBIT_CLIENT.request(f"/api/v2/torrents/info?{query}").json()
+    return tasks[0] if isinstance(tasks, list) and tasks else None
+
+
+def _completed_bare_episode_files(item):
+    """Return completed bare episode names that must be normalized first."""
+
+    files = QBIT_CLIENT.files(str(item.get("hash") or ""))
+    return [
+        str(file_item.get("name") or "")
+        for file_item in files
+        if float(file_item.get("progress") or 0) >= 1
+        and str(file_item.get("name") or "").lower().endswith(VIDEO_EXTENSIONS)
+        and bare_episode_number(PurePosixPath(str(file_item.get("name") or "")).name) is not None
+    ]
+
+
+def _promote_completed_task(item):
+    """Move a completed staged task into the directory MoviePilot scans."""
+
+    task_hash = str(item.get("hash") or "")
+    if not task_hash or is_brush_task(item):
+        return False
+    current = _task_save_path(item)
+    if is_ready_path(current, QBIT_SAVE_PATH):
+        return True
+    target = ready_save_path(current, QBIT_STAGING_PATH, QBIT_SAVE_PATH)
+    if not target:
+        print(f"episode-staging skipped unknown save path: {current}", flush=True)
+        return False
+    try:
+        QBIT_CLIENT.set_location(task_hash, target)
+    except Exception as exc:
+        print(f"episode-staging move failed {task_hash[:12]}: {exc}", flush=True)
+        return False
+    for _ in range(60):
+        try:
+            refreshed = _task_info(task_hash)
+        except Exception:
+            refreshed = None
+        if refreshed and posixpath.normpath(_task_save_path(refreshed)) == posixpath.normpath(target):
+            print(f"episode-staging promoted {task_hash[:12]} -> {target}", flush=True)
+            return True
+        time.sleep(0.5)
+    print(f"episode-staging move timeout {task_hash[:12]}", flush=True)
+    return False
+
+
+def prepare_completed_tasks(tasks):
+    """Normalize and promote completed ordinary tasks before MP can scan them."""
+
+    ready = []
+    for item in tasks or []:
+        if float(item.get("progress") or 0) < 1 or is_brush_task(item):
+            continue
+        try:
+            bare_files = _completed_bare_episode_files(item)
+        except Exception as exc:
+            print(f"episode-staging files check failed: {exc}", flush=True)
+            continue
+        if bare_files:
+            print(
+                "episode-staging retained bare files: "
+                + " | ".join(Path(name).name for name in bare_files),
+                flush=True,
+            )
+            continue
+        if _promote_completed_task(item):
+            ready.append(item)
+    return ready
 
 
 def save_queue():
@@ -1589,7 +1677,7 @@ def add_to_qbit(chat_id, user_id, category):
             "tags": "islandbot",
             "autoTMM": "false",
             "stopCondition": "MetadataReceived",
-            "savepath": download_path(category, QBIT_SAVE_PATH, CATEGORIES),
+            "savepath": download_path(category, QBIT_STAGING_PATH, CATEGORIES),
         }
         if category != "__auto__":
             add_data["category"] = category
@@ -1967,20 +2055,18 @@ def watch_completed():
     global SEEN
     tasks = task_list()
     renamed = normalize_completed_episode_files(tasks)
-    # Collect all newly completed tasks first, then trigger MoviePilot once.
-    # Previously each task triggered a separate transfer-now call, which was
-    # redundant because MoviePilot scans all completed downloads in one pass.
+    # qBittorrent may have changed file names or paths. Refresh the task list
+    # before promoting it into MoviePilot's watched directory.
+    if renamed:
+        tasks = task_list()
+    ready_tasks = prepare_completed_tasks(tasks)
+    ready_hashes = {str(item.get("hash") or "") for item in ready_tasks}
     newly_done = [
-        item for item in tasks
+        item for item in ready_tasks
         if item.get("progress", 0) >= 1 and item["hash"] not in SEEN
     ]
-    transfer_triggered = bool(renamed)
-    if renamed:
-        try:
-            moviepilot_transfer_now()
-        except Exception as exc:
-            print(f"moviepilot-transfer-now after episode normalization error: {exc}", flush=True)
-    if newly_done and not transfer_triggered:
+    transfer_triggered = bool(renamed and ready_hashes)
+    if newly_done or transfer_triggered:
         try:
             moviepilot_transfer_now()
         except Exception as exc:

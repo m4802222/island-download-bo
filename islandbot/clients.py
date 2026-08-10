@@ -404,6 +404,14 @@ class QBitClient:
             },
         ).text
 
+    def set_location(self, torrent_hash: str, location: str) -> str:
+        """Move a completed torrent into the MoviePilot-visible tree."""
+
+        return self.request(
+            "/api/v2/torrents/setLocation",
+            form={"hashes": torrent_hash, "location": location},
+        ).text
+
     def add_torrent(
         self,
         filename: str,

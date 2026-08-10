@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.4.3`。
+当前稳定版本：`v2.4.4`。
 
 ## 2.0 重构重点
 
@@ -13,6 +13,8 @@ Google Drive 的媒体流程。
 - qBittorrent 单集文件完成后若只有 `08.2160p...mkv` 这类裸编号，机器人先通过
   qBittorrent 重命名接口补齐剧名和季集号，再通知 MoviePilot；未完成的 `.mkv.!qB`
   文件、电影、刷流任务或无法确认媒体身份的任务不会改名。
+- 普通磁力和种子先写入 MoviePilot 不扫描的 staging 目录；全部完成并完成集数改名后，
+  机器人才移动到 `/downloads/complete` 并触发 MoviePilot，避免扫描竞态。
 - 只按“同一 TMDB 对应的名称 + 同一季 + 同一集”查重。第一季不会再导致
   第二季整季被跳过。
 - 自动识别第二季时拒绝使用“某某 第2季”这类独立重复 TMDB 条目；
@@ -78,7 +80,7 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.3/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.4/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
@@ -110,6 +112,9 @@ VPS 的 `.env` 中，不会显示在 Telegram 消息里。
 `QBIT_SAVE_PATH` 固定为 `/downloads/complete/islandbot`。`AUTO_CLEANUP_COMPLETED`
 开启后，仅在 MoviePilot 成功记录、历史大小、qB 文件大小和云盘实时大小四者一致时清理普通下载任务；
 刷流分类和刷流标签不会自动删除。
+
+`QBIT_STAGING_PATH` 默认是 `/downloads/incoming/islandbot`。普通任务会先保存到这里，
+完成并规范集数后才移动到 `/downloads/complete`，避免 MoviePilot 抢先扫描裸集数文件。
 
 如需检查另一个刷流 qBittorrent 的 InfoHash 冲突，请在 VPS 的机器人 `.env` 中填写
 `QBIT2_URL`、`QBIT2_USERNAME`、`QBIT2_PASSWORD`；留空则不启用该检查。

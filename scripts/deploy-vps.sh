@@ -5,7 +5,7 @@ bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
 repository=m4802222/island-download-bo
-ref=${ISLAND_BOT_REF:-v2.4.3}
+ref=${ISLAND_BOT_REF:-v2.4.4}
 archive_url="https://codeload.github.com/$repository/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
@@ -270,6 +270,7 @@ if ! docker exec "$container" python -c '
 from islandbot.app import SETTINGS
 assert SETTINGS.auto_cleanup_completed is True
 assert SETTINGS.qbit_save_path == "/downloads/complete/islandbot"
+assert SETTINGS.qbit_staging_path == "/downloads/incoming/islandbot"
 '; then
     restore_previous
 fi
