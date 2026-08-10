@@ -6,6 +6,7 @@ the only startup responsibility here.
 """
 
 from . import runtime as _runtime
+import os
 
 # Preserve the small set of mutable names used by existing integrations.  The
 # wrappers below copy test/runtime substitutions into the real runtime before
@@ -37,6 +38,10 @@ def answer(callback_id, text=None):
 
 def main():
     """Start the long-polling runtime."""
+    if os.environ.get("TELEGRAM_UI_ENGINE", "legacy").strip().lower() == "aiogram_dialog":
+        from .aiogram_ui import run
+
+        return run()
     print(f"Island Download Bot {_runtime.__version__} started", flush=True)
     while not _runtime.LAST_CATEGORY_SYNC:
         try:
@@ -46,16 +51,6 @@ def main():
             _runtime.time.sleep(10)
     while True:
         try:
-            if _runtime.time.monotonic() - _runtime.LAST_CATEGORY_SYNC >= _runtime.CATEGORY_SYNC_INTERVAL:
-                try:
-                    _runtime.synchronize_media_categories()
-                except Exception as exc:
-                    print(f"media-category-sync error: {exc}", flush=True)
-                    _runtime.LAST_CATEGORY_SYNC = (
-                        _runtime.time.monotonic()
-                        - _runtime.CATEGORY_SYNC_INTERVAL
-                        + _runtime.CATEGORY_SYNC_RETRY_INTERVAL
-                    )
             updates = _runtime.telegram(
                 "getUpdates",
                 {
@@ -66,12 +61,7 @@ def main():
             )
             for update in updates.get("result", []):
                 _runtime.handle(update)
-            _runtime.process_hermes_inbox()
-            _runtime.run_quark_queue()
-            _runtime.watch_completed()
-            _runtime.watch_aria2_completed()
-            _runtime.cleanup_transferred_qbit_tasks()
-            _runtime.delete_expired_messages()
+            _runtime.service_tick()
         except Exception as exc:
             print("error:", exc, flush=True)
             _runtime.time.sleep(5)

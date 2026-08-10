@@ -51,6 +51,30 @@ Google Drive 的媒体流程。
 - OAuth 同步只允许选择 `gdrive1` 或 `gdrive2`，且只替换对应的 `token`；
   另一个账号和固定 `MP -> gdrive2:` 别名不会被改写
 
+## 新版 Telegram 界面（预览）
+
+机器人默认继续使用旧界面，确保升级后行为不变。需要试用
+`aiogram 3 + aiogram-dialog` 界面时，在 `.env` 设置：
+
+```dotenv
+TELEGRAM_UI_ENGINE=aiogram_dialog
+```
+
+新版保留“👤 开号”按钮，也保留任务列表、任务详情、暂停/继续、删除确认和状态页。
+磁力、种子、夸克链接仍由原有业务层处理，所以不会另起一套下载规则。
+
+切回旧界面只需改回：
+
+```dotenv
+TELEGRAM_UI_ENGINE=legacy
+```
+
+重新构建镜像即可生效。`requirements.txt` 对两个项目分别使用独立的兼容范围：
+`aiogram>=3.14,<4` 和 `aiogram-dialog>=2.4,<3`。它们分别对应
+[aiogram](https://github.com/aiogram/aiogram) 与
+[aiogram-dialog](https://github.com/Tishka17/aiogram_dialog)。每次重新构建都会从包仓库取得
+各自范围内的最新版本；两者可以单独升级，不需要改业务代码。升级前部署脚本会先跑完整测试并保留上一版容器和源码备份。
+
 ## 夸克确认流程
 
 1. 发送完整资源帖或夸克链接。
@@ -76,6 +100,7 @@ Google Drive 的媒体流程。
 - `islandbot/services/transfer.py`：MoviePilot 历史与上传成功证明读取。
 - `islandbot/services/quark.py`：QAS 夸克接口、目录遍历和缺集计划。
 - `islandbot/services/telegram_ui.py`：Telegram 消息、临时提示、按钮和回调确认。
+- `islandbot/aiogram_ui.py`：可选的 aiogram 3 + aiogram-dialog 界面适配层。
 - `islandbot/handlers.py`：Telegram 更新、按钮回调和旧命令路由。
 - `islandbot/runtime.py`：运行时状态、下载编排、服务轮询和清理流程。
 - `islandbot/app.py`：启动兼容入口与主程序入口。

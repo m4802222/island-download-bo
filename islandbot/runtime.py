@@ -1078,7 +1078,7 @@ def aria_delete(chat_id, short_gid):
     return send(chat_id, "已删除 Aria2 任务及 VPS 上该任务的文件。", home_keyboard())
 
 
-def server_status(chat_id):
+def server_status_text():
     try:
         info = json.loads(qbit("/api/v2/transfer/info"))
         tasks = task_list()
@@ -1086,7 +1086,7 @@ def server_status(chat_id):
         aria_stats = aria2_rpc("aria2.getGlobalStat")
     except Exception as exc:
         print("server-status error:", exc, flush=True)
-        return send(chat_id, "🖥 状态暂时无法读取。\n请稍后点击 /start 再试。", [[{"text": "← 主菜单", "callback_data": "home:home"}]])
+        return "🖥 状态暂时无法读取。\n请稍后再试。"
     download = info.get("dl_info_speed", 0) / 1024 / 1024
     upload = info.get("up_info_speed", 0) / 1024 / 1024
     active = sum(1 for item in tasks if item.get("progress", 0) < 1)
@@ -1094,7 +1094,7 @@ def server_status(chat_id):
     aria_speed = int(aria_stats.get("downloadSpeed") or 0) / 1024 / 1024
     used = disk.total - disk.free
     drive_capacity = google_drive_capacity()
-    text = (
+    return (
         "🖥 状态与设置\n\n"
         "服务：在线\n"
         "下载器：qBittorrent 已连接\n"
@@ -1109,7 +1109,32 @@ def server_status(chat_id):
         f"账号：管理员（{OWNER}）\n"
         "权限：下载、任务管理、服务器状态"
     )
-    send(chat_id, text, [[{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}]])
+
+
+def server_status(chat_id):
+    send(
+        chat_id,
+        server_status_text(),
+        [[{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}]],
+    )
+
+
+def service_tick():
+    """Run one background maintenance cycle without polling Telegram updates."""
+    global LAST_CATEGORY_SYNC
+    now = time.monotonic()
+    if not LAST_CATEGORY_SYNC or now - LAST_CATEGORY_SYNC >= CATEGORY_SYNC_INTERVAL:
+        try:
+            synchronize_media_categories()
+        except Exception as exc:
+            print(f"media-category-sync error: {exc}", flush=True)
+            LAST_CATEGORY_SYNC = now - CATEGORY_SYNC_INTERVAL + CATEGORY_SYNC_RETRY_INTERVAL
+    process_hermes_inbox()
+    run_quark_queue()
+    watch_completed()
+    watch_aria2_completed()
+    cleanup_transferred_qbit_tasks()
+    delete_expired_messages()
 
 
 def add_magnet(chat_id, user_id, magnet, source_message_id, media_title=None):

@@ -66,6 +66,34 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "true 或 false"):
                 Settings.from_env()
 
+    def test_dialog_ui_is_opt_in(self):
+        environment = {
+            "BOT_TOKEN": "token",
+            "OWNER_ID": "123",
+            "QBIT_USERNAME": "admin",
+            "QBIT_PASSWORD": "secret",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(Settings.from_env().telegram_ui_engine, "legacy")
+        with patch.dict(
+            os.environ,
+            {**environment, "TELEGRAM_UI_ENGINE": "aiogram_dialog"},
+            clear=True,
+        ):
+            self.assertEqual(Settings.from_env().telegram_ui_engine, "aiogram_dialog")
+
+    def test_unknown_ui_engine_stops_startup(self):
+        environment = {
+            "BOT_TOKEN": "token",
+            "OWNER_ID": "123",
+            "QBIT_USERNAME": "admin",
+            "QBIT_PASSWORD": "secret",
+            "TELEGRAM_UI_ENGINE": "unknown",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "TELEGRAM_UI_ENGINE"):
+                Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

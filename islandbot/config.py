@@ -90,9 +90,13 @@ class Settings:
     qbit2_url: str
     qbit2_username: str
     qbit2_password: str
+    telegram_ui_engine: str
 
     @classmethod
     def from_env(cls) -> "Settings":
+        telegram_ui_engine = os.environ.get("TELEGRAM_UI_ENGINE", "legacy").strip().lower()
+        if telegram_ui_engine not in {"legacy", "aiogram_dialog"}:
+            raise RuntimeError("TELEGRAM_UI_ENGINE 必须是 legacy 或 aiogram_dialog")
         return cls(
             bot_token=_required("BOT_TOKEN"),
             owner_id=int(_required("OWNER_ID")),
@@ -137,4 +141,5 @@ class Settings:
             qbit2_url=os.environ.get("QBIT2_URL", "").strip().rstrip("/"),
             qbit2_username=os.environ.get("QBIT2_USERNAME", "").strip(),
             qbit2_password=os.environ.get("QBIT2_PASSWORD", "").strip(),
+            telegram_ui_engine=telegram_ui_engine,
         )

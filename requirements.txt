@@ -1,0 +1,6 @@
+python-telegram-bot==22.6
+aiohttp==3.12.15
+# Optional UI engine.  The upper bounds keep upgrades within the current
+# major versions while allowing Docker rebuilds to pick up both repositories.
+aiogram>=3.14,<4
+aiogram-dialog>=2.4,<3

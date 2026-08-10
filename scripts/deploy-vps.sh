@@ -41,6 +41,11 @@ python3 -m py_compile "$workdir/simplebot.py" "$workdir"/islandbot/*.py "$workdi
 (cd "$workdir" && python3 -m unittest discover -s tests -v)
 
 source_items=(simplebot.py Dockerfile)
+had_requirements=false
+if [ -f "$bot_dir/requirements.txt" ]; then
+    source_items+=(requirements.txt)
+    had_requirements=true
+fi
 had_version=false
 if [ -f "$bot_dir/VERSION" ]; then
     source_items+=(VERSION)
@@ -62,6 +67,9 @@ restore_source() {
     tar -xzf "$source_backup" -C "$bot_dir"
     if [ "$had_version" = false ]; then
         rm -f "$bot_dir/VERSION"
+    fi
+    if [ "$had_requirements" = false ]; then
+        rm -f "$bot_dir/requirements.txt"
     fi
     if [ -d "$previous_package" ]; then
         rm -rf "$previous_package"
@@ -108,7 +116,14 @@ docker run --rm \
     --env-file "$bot_dir/.env" \
     -e "ARIA2_SECRET=$RPC_SECRET" \
     "$image" \
-    python -c 'import islandbot.app; print("IMPORT_OK")'
+    python -c '
+import islandbot.app
+from islandbot.config import SETTINGS
+if SETTINGS.telegram_ui_engine == "aiogram_dialog":
+    import aiogram, aiogram_dialog
+    print("AIOGRAM_UI_DEPS_OK", aiogram.__version__)
+print("IMPORT_OK")
+'
 
 if ! {
     install -m 0644 "$workdir/simplebot.py" "$bot_dir/simplebot.py" &&
@@ -271,6 +286,7 @@ from islandbot.app import SETTINGS
 assert SETTINGS.auto_cleanup_completed is True
 assert SETTINGS.qbit_save_path == "/downloads/complete/islandbot"
 assert SETTINGS.qbit_staging_path == "/downloads/incoming/islandbot"
+assert SETTINGS.telegram_ui_engine in {"legacy", "aiogram_dialog"}
 '; then
     restore_previous
 fi

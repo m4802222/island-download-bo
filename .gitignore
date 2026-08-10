@@ -7,4 +7,3 @@ __pycache__/
 # Local draft files — not part of the production bot
 bot.py
 Dockerfile.simple
-requirements.txt
