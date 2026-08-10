@@ -48,12 +48,32 @@ def message_text_with_links(message: dict[str, Any]) -> str:
 
 
 def extract_post_title(text: str) -> str | None:
-    """Extract only the explicit title/year line, never descriptions."""
+    """Extract an explicit title line without treating descriptions as titles.
+
+    Resource channels commonly prefix the title with ``🎬`` and put the year
+    nowhere in that line (for example ``🎬 毛骨悚然的恋爱 [NF]...``).  The
+    previous parser only accepted ``Title (Year)``, so those otherwise valid
+    full-post messages reached the bot without a media identity.
+    """
     ignored_labels = ("发布时间", "资源大小", "链接状态", "投稿ID")
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
         if not re.search(r"[\u4e00-\u9fff]", line):
             continue
+        if line.startswith("🎬"):
+            candidate = re.sub(r"^🎬\s*", "", line).strip()
+            year_match = re.search(r"(.+?[（(]\d{4}[)）])", candidate)
+            if year_match:
+                candidate = year_match.group(1)
+            # Channel metadata follows the title in square/full-width
+            # brackets.  Keep only the title before that decoration.
+            else:
+                candidate = re.split(r"\s*[\[【]", candidate, maxsplit=1)[0].strip()
+            if candidate:
+                try:
+                    return clean_title(candidate)
+                except RuntimeError:
+                    return None
         match = re.search(r"(.+?[（(]\d{4}[)）])", line)
         if not match:
             continue

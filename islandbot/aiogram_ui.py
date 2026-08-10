@@ -17,6 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
 from aiogram_dialog import Dialog, DialogManager, StartMode, Window, setup_dialogs
 from aiogram_dialog.widgets.kbd import Button, Column, Row, Select
+from aiogram_dialog.widgets.input import MessageInput
 from aiogram_dialog.widgets.text import Const, Format
 
 from . import runtime
@@ -307,9 +308,19 @@ async def incoming_message(message: Message, dialog_manager: DialogManager) -> N
     await asyncio.to_thread(runtime.handle, {"update_id": 0, "message": raw})
 
 
+async def dialog_message_input(
+    message: Message,
+    _: MessageInput,
+    dialog_manager: DialogManager,
+) -> None:
+    """Keep the active dialog from swallowing ordinary download messages."""
+    await incoming_message(message, dialog_manager)
+
+
 dialog = Dialog(
     Window(
         Const("🏝 Island Download\n\n发送 magnet、.torrent 或夸克分享链接。\n下载完成后 MoviePilot 自动整理并上传。"),
+        MessageInput(dialog_message_input),
         Row(
             Button(Const("👤 开号"), id="account", on_click=open_account),
             Button(Const("📋 我的任务"), id="tasks", on_click=open_tasks),
@@ -319,6 +330,7 @@ dialog = Dialog(
     ),
     Window(
         Format("{task_summary}"),
+        MessageInput(dialog_message_input),
         Column(Select(Format("{item[display]}"), id="task_select", item_id_getter=lambda item: item["id"], items="task_rows", on_click=task_selected)),
         Row(Button(Const("刷新"), id="refresh", on_click=open_tasks), Button(Const("← 主菜单"), id="home", on_click=go_home)),
         state=MainSG.tasks,
@@ -326,6 +338,7 @@ dialog = Dialog(
     ),
     Window(
         Format("{task_text}"),
+        MessageInput(dialog_message_input),
         Button(Format("{task_control}"), id="toggle", on_click=task_toggle),
         Button(Const("删除"), id="delete", on_click=ask_delete),
         Button(Const("← 任务列表"), id="back", on_click=open_tasks),
@@ -334,17 +347,20 @@ dialog = Dialog(
     ),
     Window(
         Const("确定删除这个任务及 VPS 文件吗？这个操作无法恢复。"),
+        MessageInput(dialog_message_input),
         Row(Button(Const("确认删除"), id="yes", on_click=delete_task), Button(Const("取消"), id="no", on_click=lambda c, w, m: m.switch_to(MainSG.task))),
         state=MainSG.delete,
     ),
     Window(
         Format("{status_text}"),
+        MessageInput(dialog_message_input),
         Row(Button(Const("刷新"), id="refresh", on_click=open_status), Button(Const("← 主菜单"), id="home", on_click=go_home)),
         state=MainSG.status,
         getter=status_getter,
     ),
     Window(
         Const("👤 开号\n\n请输入新 Emby 用户名。\n密码使用系统默认值，仅有普通观看权限。\n输入 /cancel 可取消。"),
+        MessageInput(dialog_message_input),
         Button(Const("取消"), id="cancel", on_click=account_cancel),
         state=MainSG.account,
     ),
@@ -367,6 +383,8 @@ async def _run() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(dialog)
     setup_dialogs(dp)
+    # Messages not consumed by a window's MessageInput are handled by the
+    # compatibility router (for example before a dialog has been started).
     dp.include_router(router)
     maintenance = asyncio.create_task(_maintenance_loop())
     try:

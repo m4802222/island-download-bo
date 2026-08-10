@@ -9,6 +9,13 @@ from islandbot.parsing import (
 
 
 class ResourcePostParsingTests(unittest.TestCase):
+    def test_extracts_channel_title_without_year(self):
+        text = """🎬 毛骨悚然的恋爱 [NF][内封多国语字幕][更新至08集]
+🆔 投稿ID：47942
+🔗 链接状态：🟢 正常
+https://pan.quark.cn/s/37ba5c8ad0a8"""
+        self.assertEqual(extract_post_title(text), "毛骨悚然的恋爱")
+
     def test_extracts_title_not_description(self):
         text = """🎬 非份之罪 (2026) 4K WEB-DL 国语+粤语 中字
 🕒 发布时间：2026-07-27
