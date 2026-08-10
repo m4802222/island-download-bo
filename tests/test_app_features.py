@@ -167,5 +167,43 @@ class EpisodeNormalizerTests(unittest.TestCase):
                 app.RESOLVER = original_resolver
 
 
+class TelegramCallbackTests(unittest.TestCase):
+    def test_expired_callback_does_not_break_update_loop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = {
+                "BOT_TOKEN": "test",
+                "OWNER_ID": "1",
+                "QBIT_USERNAME": "test",
+                "QBIT_PASSWORD": "test",
+                "DATA_DIR": str(Path(temp) / "data"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                app = importlib.import_module("islandbot.app")
+            with patch.object(
+                app,
+                "telegram",
+                side_effect=RuntimeError(
+                    "Telegram 请求失败（HTTP 400）Bad Request: "
+                    "query is too old and response timeout expired"
+                ),
+            ):
+                app.answer("expired-callback")
+
+    def test_unrelated_callback_error_is_still_raised(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = {
+                "BOT_TOKEN": "test",
+                "OWNER_ID": "1",
+                "QBIT_USERNAME": "test",
+                "QBIT_PASSWORD": "test",
+                "DATA_DIR": str(Path(temp) / "data"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                app = importlib.import_module("islandbot.app")
+            with patch.object(app, "telegram", side_effect=RuntimeError("HTTP 500")):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
+                    app.answer("broken-callback")
+
+
 if __name__ == "__main__":
     unittest.main()

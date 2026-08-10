@@ -972,7 +972,22 @@ def answer(callback_id, text=None):
     data = {"callback_query_id": callback_id}
     if text:
         data["text"] = text
-    telegram("answerCallbackQuery", data)
+    try:
+        telegram("answerCallbackQuery", data)
+    except RuntimeError as exc:
+        # Telegram callback buttons expire quickly.  A user can legitimately
+        # click an old bot card after it has been sitting in the chat for a
+        # while; that must not abort the update loop or make newer buttons
+        # appear unresponsive.
+        message = str(exc).lower()
+        expired = (
+            "query is too old" in message
+            or "response timeout expired" in message
+            or "query id is invalid" in message
+        )
+        if not expired:
+            raise
+        print("telegram callback expired; continuing", flush=True)
 
 
 def home_keyboard():
