@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.4.4`。
+当前稳定版本：`v2.4.5`。
 
 ## 2.0 重构重点
 
@@ -80,7 +80,7 @@ Google Drive 的媒体流程。
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.4/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.4.5/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
@@ -115,6 +115,8 @@ VPS 的 `.env` 中，不会显示在 Telegram 消息里。
 
 `QBIT_STAGING_PATH` 默认是 `/downloads/incoming/islandbot`。普通任务会先保存到这里，
 完成并规范集数后才移动到 `/downloads/complete`，避免 MoviePilot 抢先扫描裸集数文件。
+qBittorrent 的共享分类默认路径仍保持在 `/downloads/complete/<分类>`，以兼容 MoviePilot
+和 PT 站任务；机器人通过添加任务时显式指定 staging 路径，不会改变共享分类的默认路径。
 
 如需检查另一个刷流 qBittorrent 的 InfoHash 冲突，请在 VPS 的机器人 `.env` 中填写
 `QBIT2_URL`、`QBIT2_USERNAME`、`QBIT2_PASSWORD`；留空则不启用该检查。

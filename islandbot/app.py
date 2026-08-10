@@ -844,7 +844,9 @@ def synchronize_media_categories():
         required=True,
     )
     result = QBIT_CLIENT.sync_categories(
-        qbit_category_paths(categories, QBIT_STAGING_PATH),
+        # These are shared qBittorrent categories.  MoviePilot/PT tasks use
+        # them too, so their default paths must remain MoviePilot-visible.
+        qbit_category_paths(categories, QBIT_SAVE_PATH),
         set(LEGACY_QBIT_CATEGORIES),
     )
     CATEGORIES[:] = categories
