@@ -1,5 +1,4 @@
 import json
-import posixpath
 import shutil
 import sqlite3
 import subprocess
@@ -10,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from . import __version__
 from .clients import (
@@ -32,19 +31,17 @@ from .cleanup import is_brush_task, safe_to_cleanup, selected_video_sizes
 from .library import missing_plan
 from .media import (
     VIDEO_EXTENSIONS,
-    bare_episode_number,
     clean_title,
     episode_key as domain_episode_key,
     episode_keys as domain_episode_keys,
     explicit_seasons,
-    normalize_bare_episode_filename,
     parse_identity_label,
     season_number,
 )
 from .resolver import MediaResolver, ResolutionError
 from .retry import cloud_block_status
 from .storage import IdentityStore, JsonStore
-from .staging import is_ready_path, ready_save_path
+from .services.normalizer import EpisodeNormalizer
 from .transfer_verification import (
     load_successful_transfer_proofs,
     verified_transfer_sources,
@@ -147,19 +144,23 @@ RESOLVER = MediaResolver(
     MoviePilotClient(MOVIEPILOT_URL, MOVIEPILOT_TOKEN),
     IDENTITIES,
 )
-# A successful identity is reused for the lifetime of the process. Failed
-# probes are throttled so a malformed torrent cannot cause a network request
-# on every polling tick.
-NORMALIZE_IDENTITY_CACHE = {}
-NORMALIZE_LAST_ATTEMPT = {}
-NORMALIZE_RETRY_SECONDS = 300
-
 CATEGORIES = list(CANONICAL_CATEGORIES)
 TELEGRAM_CLIENT = TelegramClient(TOKEN)
 ARIA2_CLIENT = Aria2Client(ARIA2_URL, ARIA2_SECRET)
 QAS_CLIENT = QasClient(QAS_URL, QAS_USER, QAS_PASSWORD)
 QBIT_CLIENT = QBitClient(QBIT_URL, QBIT_USER, QBIT_PASSWORD)
 EMBY_CLIENT = EmbyClient(SETTINGS.emby_url, SETTINGS.emby_api_key)
+NORMALIZER = EpisodeNormalizer(
+    QBIT_CLIENT,
+    RESOLVER,
+    QBIT_STAGING_PATH,
+    QBIT_SAVE_PATH,
+)
+# Compatibility aliases for existing tests and state inspection tools. The
+# normalizer service owns these dictionaries; app.py no longer owns the logic.
+NORMALIZE_IDENTITY_CACHE = NORMALIZER.identity_cache
+NORMALIZE_LAST_ATTEMPT = NORMALIZER.last_attempt
+NORMALIZE_RETRY_SECONDS = NORMALIZER.retry_seconds
 LAST_QBIT_CLEANUP = 0.0
 LAST_CATEGORY_SYNC = 0.0
 CATEGORY_SYNC_INTERVAL = 6 * 60 * 60
@@ -1020,218 +1021,20 @@ def task_list():
     return json.loads(qbit("/api/v2/torrents/info?tag=islandbot&sort=added_on&reverse=true"))
 
 
-def _release_title_probe(value):
-    """Strip common release suffixes before asking MoviePilot to identify it."""
-
-    text = Path(str(value or "")).name
-    text = re.sub(r"(?i)\s*\{tmdb-\d+\}.*$", "", text)
-    text = re.sub(
-        r"(?i)[ ._-]+(?:8k|4k|2160p|1440p|1080p|720p|576p|480p|web[- .]?dl|webrip|bluray|bdrip|hdtv|dvdrip)(?:[ ._-].*)?$",
-        "",
-        text,
-    )
-    return text.strip(" ._-")
-
-
-def _completed_task_root(item):
-    """Return a bot-owned qBittorrent content directory, if it is visible."""
-
-    roots = {
-        Path(QBIT_SAVE_PATH).parent,
-        Path(QBIT_STAGING_PATH).parent,
-    }
-    raw = item.get("content_path") or item.get("save_path") or QBIT_SAVE_PATH
-    root = Path(str(raw))
-    if root.is_file():
-        root = root.parent
-    if not any(root == base or base in root.parents for base in roots):
-        return None
-    if any(root == base for base in roots):
-        name = str(item.get("name") or "").strip()
-        candidate = root / name if name else None
-        if not candidate or not candidate.is_dir():
-            return None
-        root = candidate
-    return root if root.is_dir() else None
-
-
-def _confirmed_tv_identity(item, root):
-    """Resolve a completed torrent folder conservatively as a TV identity."""
-
-    key = f"{item.get('hash') or ''}|{root}"
-    cached = NORMALIZE_IDENTITY_CACHE.get(key)
-    if cached:
-        return cached
-    now = time.monotonic()
-    last_attempt = NORMALIZE_LAST_ATTEMPT.get(key)
-    if last_attempt is not None and now - last_attempt < NORMALIZE_RETRY_SECONDS:
-        return None
-    NORMALIZE_LAST_ATTEMPT[key] = now
-    probes = [root.name, item.get("name")]
-    for probe in probes:
-        title = _release_title_probe(probe)
-        if not title:
-            continue
-        try:
-            identity = RESOLVER.automatic(title)
-        except (ResolutionError, ValueError) as exc:
-            print(f"episode-normalizer resolve skipped {title}: {exc}", flush=True)
-            continue
-        if identity.media_type != "电视剧":
-            print(f"episode-normalizer skipped non-TV task: {title}", flush=True)
-            continue
-        NORMALIZE_IDENTITY_CACHE[key] = identity
-        return identity
-    print(f"episode-normalizer skipped ambiguous task: {root}", flush=True)
-    return None
-
-
 def normalize_completed_episode_files(tasks):
-    """Rename completed bare episode files before MoviePilot scans them.
-
-    Only files with a real video extension are considered, so qBittorrent's
-    active ``.mkv.!qB`` files are never touched. Movies, brush tasks and folders
-    whose TV identity cannot be confirmed are left unchanged.
-    """
-
-    renamed = []
-    for item in tasks or []:
-        if is_brush_task(item):
-            continue
-        root = _completed_task_root(item)
-        if not root:
-            continue
-        task_hash = str(item.get("hash") or "")
-        if not task_hash:
-            continue
-        try:
-            files = QBIT_CLIENT.files(task_hash)
-        except Exception as exc:
-            print(f"episode-normalizer files {task_hash[:12]} failed: {exc}", flush=True)
-            continue
-        candidates = []
-        for file_item in files:
-            if float(file_item.get("progress") or 0) < 1:
-                continue
-            old_path = str(file_item.get("name") or "")
-            old_name = PurePosixPath(old_path).name
-            if bare_episode_number(old_name) is not None:
-                candidates.append((old_path, old_name))
-        if not candidates:
-            continue
-        identity = _confirmed_tv_identity(item, root)
-        if not identity:
-            continue
-        existing_paths = {
-            str(file_item.get("name") or "")
-            for file_item in files
-            if file_item.get("name")
-        }
-        for old_path, old_name in candidates:
-            target_name = normalize_bare_episode_filename(
-                old_name,
-                identity.title,
-                identity.season or 1,
-            )
-            if not target_name:
-                continue
-            target_path = str(PurePosixPath(old_path).with_name(Path(target_name).name))
-            if target_path in existing_paths:
-                print(f"episode-normalizer conflict, keeping {old_path}", flush=True)
-                continue
-            try:
-                QBIT_CLIENT.rename_file(task_hash, old_path, target_path)
-            except Exception as exc:
-                print(f"episode-normalizer rename failed {old_path}: {exc}", flush=True)
-                continue
-            renamed.append((old_path, target_path))
-            existing_paths.add(target_path)
-            print(f"episode-normalizer renamed {old_name} -> {Path(target_path).name}", flush=True)
-    return renamed
-
-
-def _task_save_path(item):
-    """Return qBittorrent's directory for one task."""
-
-    save_path = str(item.get("save_path") or "").strip()
-    if save_path:
-        return save_path
-    content_path = str(item.get("content_path") or "").strip()
-    return str(Path(content_path).parent) if content_path else ""
-
-
-def _task_info(torrent_hash):
-    query = urllib.parse.urlencode({"hash": torrent_hash})
-    tasks = QBIT_CLIENT.request(f"/api/v2/torrents/info?{query}").json()
-    return tasks[0] if isinstance(tasks, list) and tasks else None
-
-
-def _completed_bare_episode_files(item):
-    """Return completed bare episode names that must be normalized first."""
-
-    files = QBIT_CLIENT.files(str(item.get("hash") or ""))
-    return [
-        str(file_item.get("name") or "")
-        for file_item in files
-        if float(file_item.get("progress") or 0) >= 1
-        and str(file_item.get("name") or "").lower().endswith(VIDEO_EXTENSIONS)
-        and bare_episode_number(PurePosixPath(str(file_item.get("name") or "")).name) is not None
-    ]
-
-
-def _promote_completed_task(item):
-    """Move a completed staged task into the directory MoviePilot scans."""
-
-    task_hash = str(item.get("hash") or "")
-    if not task_hash or is_brush_task(item):
-        return False
-    current = _task_save_path(item)
-    if is_ready_path(current, QBIT_SAVE_PATH):
-        return True
-    target = ready_save_path(current, QBIT_STAGING_PATH, QBIT_SAVE_PATH)
-    if not target:
-        print(f"episode-staging skipped unknown save path: {current}", flush=True)
-        return False
-    try:
-        QBIT_CLIENT.set_location(task_hash, target)
-    except Exception as exc:
-        print(f"episode-staging move failed {task_hash[:12]}: {exc}", flush=True)
-        return False
-    for _ in range(60):
-        try:
-            refreshed = _task_info(task_hash)
-        except Exception:
-            refreshed = None
-        if refreshed and posixpath.normpath(_task_save_path(refreshed)) == posixpath.normpath(target):
-            print(f"episode-staging promoted {task_hash[:12]} -> {target}", flush=True)
-            return True
-        time.sleep(0.5)
-    print(f"episode-staging move timeout {task_hash[:12]}", flush=True)
-    return False
+    """Compatibility wrapper for the extracted normalizer service."""
+    # Keep legacy module-level seams used by tests and integrations working
+    # while the service owns its production dependencies.
+    NORMALIZER.qbit = QBIT_CLIENT
+    NORMALIZER.resolver = RESOLVER
+    return NORMALIZER.normalize_completed_episode_files(tasks)
 
 
 def prepare_completed_tasks(tasks):
-    """Normalize and promote completed ordinary tasks before MP can scan them."""
-
-    ready = []
-    for item in tasks or []:
-        if float(item.get("progress") or 0) < 1 or is_brush_task(item):
-            continue
-        try:
-            bare_files = _completed_bare_episode_files(item)
-        except Exception as exc:
-            print(f"episode-staging files check failed: {exc}", flush=True)
-            continue
-        if bare_files:
-            print(
-                "episode-staging retained bare files: "
-                + " | ".join(Path(name).name for name in bare_files),
-                flush=True,
-            )
-            continue
-        if _promote_completed_task(item):
-            ready.append(item)
-    return ready
+    """Compatibility wrapper for staging promotion."""
+    NORMALIZER.qbit = QBIT_CLIENT
+    NORMALIZER.resolver = RESOLVER
+    return NORMALIZER.prepare_completed_tasks(tasks)
 
 
 def save_queue():
