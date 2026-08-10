@@ -1,5 +1,6 @@
 import json
 import shutil
+import sys
 import threading
 import time
 import re
@@ -44,6 +45,7 @@ from .services.drive import DriveService
 from .services.quark import QuarkService
 from .services.transfer import TransferService
 from .services.telegram_ui import TelegramUI
+from .handlers import BotHandlers
 from .config import Settings, explicit_web_port
 from .parsing import (
     extract_magnet,
@@ -158,6 +160,7 @@ TELEGRAM_UI = TelegramUI(
     lambda: CATEGORIES,
     lambda: MAX_ACTIVE_DOWNLOADS,
 )
+HANDLERS = BotHandlers(lambda: sys.modules[__name__])
 NORMALIZER = EpisodeNormalizer(
     QBIT_CLIENT,
     RESOLVER,
@@ -1274,316 +1277,18 @@ def add_to_qbit(chat_id, user_id, category):
 
 
 def legacy_command(chat_id, text):
-    if text == "/tasks":
-        return show_tasks(chat_id)
-    parts = text.split(maxsplit=1)
-    if len(parts) != 2 or parts[0] not in {"/pause", "/resume", "/delete"}:
-        return False
-    item = find_task(parts[1].strip())
-    if not item:
-        send(chat_id, "没有找到唯一任务，请在“我的任务”中选择。")
-        return True
-    command = parts[0][1:]
-    qbit_action(command, item["hash"], delete_files=command == "delete")
-    if command in {"pause", "delete"} and item["hash"] in QUEUE:
-        QUEUE.remove(item["hash"])
-        save_queue()
-    elif command == "resume" and item.get("progress", 0) < 1 and item["hash"] not in QUEUE:
-        QUEUE.append(item["hash"])
-        save_queue()
-    run_queue()
-    send(chat_id, f"已{ '删除' if command == 'delete' else ('暂停' if command == 'pause' else '继续') }：{item.get('name', '')[:45]}")
-    return True
+    """Compatibility entry point backed by the extracted Telegram handlers."""
+    return HANDLERS.legacy_command(chat_id, text)
 
 
 def handle_callback(callback):
-    user_id = callback["from"]["id"]
-    chat_id = callback["message"]["chat"]["id"]
-    answer(callback["id"])
-    if user_id != OWNER:
-        return
-    # Telegram has no native single-page UI. Remove the previous bot card before
-    # rendering the next one, so the conversation stays clean and app-like.
-    try:
-        telegram("deleteMessage", {"chat_id": chat_id, "message_id": callback["message"]["message_id"]})
-    except Exception:
-        pass
-    data = callback.get("data", "")
-    if data == "home:home":
-        return home(chat_id, callback["from"].get("first_name", ""))
-    if data == "account:create":
-        ACCOUNT_PENDING[str(chat_id)] = {"created_at": time.time()}
-        save_account_pending()
-        return send(
-            chat_id,
-            "请输入新账号的用户名。\n\n密码固定为 123456，仅有普通观看权限。\n输入 /cancel 可取消。",
-            [[{"text": "取消", "callback_data": "account:cancel"}]],
-        )
-    if data == "account:cancel":
-        ACCOUNT_PENDING.pop(str(chat_id), None)
-        save_account_pending()
-        return home(chat_id, callback["from"].get("first_name", ""))
-    if data == "home:tasks":
-        return show_tasks(chat_id)
-    if data == "home:completed":
-        return show_recent_completed(chat_id)
-    if data == "home:server":
-        return server_status(chat_id)
-    if data == "quarkusecandidate":
-        pending = QUARK_TITLE_PENDING.get(str(chat_id))
-        if not pending or not pending.get("candidate"):
-            return send(chat_id, "这个名称确认已过期，请重新发送分享链接。", home_keyboard())
-        try:
-            title = moviepilot_media_title(pending["candidate"])
-        except RuntimeError as exc:
-            return send(chat_id, str(exc))
-        QUARK_TITLE_PENDING.pop(str(chat_id), None)
-        save_quark_title_pending()
-        return confirm_quark_download(chat_id, pending["url"], title)
-    if data == "quarkcancelcandidate":
-        QUARK_TITLE_PENDING.pop(str(chat_id), None)
-        save_quark_title_pending()
-        return send(chat_id, "已取消这次夸克下载。", home_keyboard())
-    if data.startswith("quarkconfirm:"):
-        key = data.split(":", 1)[1]
-        pending = QUARK_CONFIRM_PENDING.get(key)
-        if not pending:
-            return send(chat_id, "这个确认已过期，请重新发送分享链接。", home_keyboard())
-        if not safe_confirmed_media_title(pending["media_title"]):
-            QUARK_CONFIRM_PENDING.pop(key, None)
-            save_quark_confirm_pending()
-            return request_quark_title(
-                chat_id,
-                pending["url"],
-                pending["media_title"],
-                "旧识别结果无效，已禁止下载",
-            )
-        try:
-            result = enqueue_quark_task(
-                chat_id,
-                pending["url"],
-                pending["media_title"],
-            )
-        except Exception as exc:
-            print("quark-confirm error:", exc, flush=True)
-            return send(
-                chat_id,
-                f"⚠️ 暂未开始下载\n\n{pending['media_title']}\n"
-                f"原因：{str(exc)[:180]}\n\n"
-                "确认记录已保留，可以直接重试，不会重复创建任务。",
-                [
-                    [{"text": "重试提交", "callback_data": f"quarkconfirm:{key}"}],
-                    [
-                        {"text": "修改剧名", "callback_data": f"quarkedit:{key}"},
-                        {"text": "取消", "callback_data": f"quarkcancel:{key}"},
-                    ],
-                ],
-            )
-        QUARK_CONFIRM_PENDING.pop(key, None)
-        save_quark_confirm_pending()
-        return result
-    if data.startswith("quarkedit:"):
-        key = data.split(":", 1)[1]
-        pending = QUARK_CONFIRM_PENDING.pop(key, None)
-        save_quark_confirm_pending()
-        if not pending:
-            return send(chat_id, "这个确认已过期，请重新发送分享链接。", home_keyboard())
-        return request_quark_title(chat_id, pending["url"], pending["media_title"], "请修正媒体身份")
-    if data.startswith("quarkcancel:"):
-        key = data.split(":", 1)[1]
-        QUARK_CONFIRM_PENDING.pop(key, None)
-        save_quark_confirm_pending()
-        return send(chat_id, "已取消这次夸克下载。", home_keyboard())
-    if data.startswith("quarkselect:"):
-        _, key, index_text = data.split(":", 2)
-        pending = QUARK_PENDING.pop(key, None)
-        save_quark_pending()
-        if not pending:
-            return send(chat_id, "这个夸克选择已过期，请重新发送分享链接。", home_keyboard())
-        try:
-            folder = pending["folders"][int(index_text)]
-        except (ValueError, IndexError):
-            return send(chat_id, "文件夹选择无效，请重新发送分享链接。", home_keyboard())
-        selected_url = selected_share_url(pending["url"], folder)
-        title = pending.get("title_hint")
-        if not title:
-            folder_title = folder_media_title(folder["name"])
-            try:
-                title = moviepilot_media_title(folder_title) if folder_title else None
-            except RuntimeError as exc:
-                return request_quark_title(
-                    chat_id,
-                    selected_url,
-                    folder["name"],
-                    str(exc),
-                    pending.get("raw_title") or folder_title,
-                )
-        if title:
-            return confirm_quark_download(chat_id, selected_url, title)
-        return request_quark_title(
-            chat_id,
-            selected_url,
-            folder["name"],
-            pending.get("title_error"),
-            pending.get("raw_title"),
-        )
-    if data.startswith("category:"):
-        return add_to_qbit(chat_id, user_id, data.split(":", 1)[1])
-    if data.startswith("task:"):
-        return show_task(chat_id, data.split(":", 1)[1])
-    if data.startswith("aria:"):
-        return show_aria_task(chat_id, data.split(":", 1)[1])
-    if data.startswith("ariaaction:"):
-        _, action, short_gid = data.split(":", 2)
-        return aria_action(chat_id, action, short_gid)
-    if data.startswith("ariadeleteask:"):
-        short_gid = data.split(":", 1)[1]
-        return send(chat_id, "确定删除 Aria2 任务及 VPS 未完成文件吗？", [[{"text": "确认删除", "callback_data": f"ariadeleteyes:{short_gid}"}, {"text": "取消", "callback_data": f"aria:{short_gid}"}]])
-    if data.startswith("ariadeleteyes:"):
-        return aria_delete(chat_id, data.split(":", 1)[1])
-    if data.startswith("action:"):
-        _, action, short_hash = data.split(":", 2)
-        item = find_task(short_hash)
-        if not item:
-            return send(chat_id, "任务不存在。", home_keyboard())
-        qbit_action(action, item["hash"])
-        if action == "pause" and item["hash"] in QUEUE:
-            QUEUE.remove(item["hash"])
-            save_queue()
-        elif action == "resume" and item.get("progress", 0) < 1 and item["hash"] not in QUEUE:
-            QUEUE.append(item["hash"])
-            save_queue()
-        run_queue()
-        return show_task(chat_id, short_hash)
-    if data.startswith("deleteask:"):
-        short_hash = data.split(":", 1)[1]
-        return send(chat_id, "确定删除此任务及 VPS 中已下载文件吗？这个操作无法恢复。", [[{"text": "确认删除", "callback_data": f"deleteyes:{short_hash}"}, {"text": "取消", "callback_data": f"task:{short_hash}"}]])
-    if data.startswith("deleteyes:"):
-        item = find_task(data.split(":", 1)[1])
-        if not item:
-            return send(chat_id, "任务不存在。", home_keyboard())
-        qbit("/api/v2/torrents/delete", {"hashes": item["hash"], "deleteFiles": "true"})
-        if item["hash"] in QUEUE:
-            QUEUE.remove(item["hash"])
-            save_queue()
-        run_queue()
-        return send(chat_id, "任务及 VPS 文件已删除。", home_keyboard())
+    """Compatibility entry point backed by the extracted Telegram handlers."""
+    return HANDLERS.handle_callback(callback)
 
 
 def handle(update):
-    global OFFSET
-    OFFSET = update["update_id"] + 1
-    if update.get("callback_query"):
-        return handle_callback(update["callback_query"])
-    message = update.get("message")
-    if not message or message.get("from", {}).get("id") != OWNER:
-        return
-    chat_id = message["chat"]["id"]
-    text = message_text_with_links(message)
-    if str(chat_id) in ACCOUNT_PENDING:
-        if text == "/cancel":
-            ACCOUNT_PENDING.pop(str(chat_id), None)
-            save_account_pending()
-            return send(chat_id, "已取消开号。", home_keyboard())
-        if not text or text.startswith("/"):
-            return send(chat_id, "请直接输入用户名，或输入 /cancel 取消。")
-        try:
-            account = EMBY_CLIENT.create_viewer(
-                text,
-                SETTINGS.emby_default_password,
-            )
-        except RuntimeError as exc:
-            return send(chat_id, f"开号失败：{exc}\n\n请换一个用户名重试，或输入 /cancel 取消。")
-        ACCOUNT_PENDING.pop(str(chat_id), None)
-        save_account_pending()
-        login = (
-            f"\n登录地址：{explicit_web_port(SETTINGS.emby_public_url)}"
-            if SETTINGS.emby_public_url
-            else ""
-        )
-        return send(
-            chat_id,
-            f"✅ Emby 普通观看账号已创建\n\n"
-            f"用户名：{account['username']}\n"
-            f"密码：{SETTINGS.emby_default_password}"
-            f"{login}\n\n"
-            "已关闭管理、删除、下载、字幕管理和共享权限。",
-            home_keyboard(),
-        )
-    document = message.get("document")
-    if document:
-        # A .torrent can carry its media title in the Telegram caption.  Keep
-        # that explicit metadata for MoviePilot-history deduplication.
-        return add_torrent_file(
-            chat_id,
-            OWNER,
-            document,
-            message["message_id"],
-            extract_post_title(message.get("caption", "")),
-        )
-    title_pending = QUARK_TITLE_PENDING.get(str(chat_id))
-    if title_pending:
-        if text == "/cancel":
-            QUARK_TITLE_PENDING.pop(str(chat_id), None)
-            save_quark_title_pending()
-            return send(chat_id, "已取消这次夸克下载。", home_keyboard())
-        # Re-forwarding a complete resource post while a title is pending must
-        # restart normal post parsing.  Do not feed its description and links
-        # to MoviePilot as though the whole message were a title.
-        repeated_quark_share = extract_quark_share(text)
-        if repeated_quark_share:
-            QUARK_TITLE_PENDING.pop(str(chat_id), None)
-            save_quark_title_pending()
-            return add_quark_share(
-                chat_id,
-                repeated_quark_share,
-                message["message_id"],
-                extract_post_title(text),
-            )
-        if text and not text.startswith("/") and not text.startswith("magnet:"):
-            try:
-                title = resolve_pending_media_text(text, title_pending)
-            except RuntimeError as exc:
-                return send(chat_id, str(exc))
-            QUARK_TITLE_PENDING.pop(str(chat_id), None)
-            save_quark_title_pending()
-            return confirm_quark_download(chat_id, title_pending["url"], title)
-    quark_share = extract_quark_share(text)
-    if quark_share:
-        return add_quark_share(chat_id, quark_share, message["message_id"], extract_post_title(text))
-    magnet = extract_magnet(text)
-    if magnet:
-        return add_magnet(
-            chat_id,
-            OWNER,
-            magnet,
-            message["message_id"],
-            extract_post_title(text),
-        )
-    if text in {"/start", "/menu"}:
-        return home(chat_id, message["from"].get("first_name", ""))
-    if text == "/help":
-        return send(chat_id, f"发送 magnet、夸克分享链接或上传 .torrent 文件即可。\n系统会智能分类，同时最多下载 {MAX_ACTIVE_DOWNLOADS} 个任务。\n下载完成后由 MoviePilot 自动整理、命名并上传。\n\n/tasks 可查看任务。")
-    if legacy_command(chat_id, text):
-        return
-    if any(word in text for word in ("空间", "硬盘", "云盘", "容量", "服务器状态")):
-        return server_status(chat_id)
-    if any(word in text for word in ("任务", "队列", "下载进度")):
-        return show_tasks(chat_id)
-    detected_title = extract_post_title(text)
-    if detected_title or any(marker in text for marker in ("投稿ID", "资源信息", "投稿来源")):
-        title_line = f"\n\n识别到标题：{detected_title}" if detected_title else ""
-        return send(
-            chat_id,
-            f"⚠️ 未检测到下载链接{title_line}\n\n"
-            "请发送包含夸克链接、magnet 链接的完整消息，或上传 .torrent 文件。",
-            home_keyboard(),
-        )
-    # Run in a background thread so Ollama latency (up to 15 s) never
-    # blocks the main polling loop from processing other Telegram messages.
-    def _send_ai_reply(cid=chat_id, question=text):
-        send(cid, ai_reply(question))
-    threading.Thread(target=_send_ai_reply, daemon=True).start()
+    """Route one Telegram update through the extracted handler service."""
+    return HANDLERS.handle(update)
 
 
 def watch_completed():
