@@ -38,7 +38,7 @@ ACCOUNT_WAITING: set[int] = set()
 router = Router(name="island-download-bot-input")
 
 
-def _owner(message: Message) -> bool:
+def _owner(message: Message | CallbackQuery) -> bool:
     return bool(message.from_user and message.from_user.id == runtime.OWNER)
 
 
@@ -306,6 +306,15 @@ async def incoming_message(message: Message, dialog_manager: DialogManager) -> N
         return
     raw = message.model_dump(by_alias=True, exclude_none=True)
     await asyncio.to_thread(runtime.handle, {"update_id": 0, "message": raw})
+
+
+@router.callback_query()
+async def legacy_callback(callback: CallbackQuery) -> None:
+    """Forward legacy business buttons (quarkconfirm, category, task, ...)."""
+    if not _owner(callback):
+        return
+    raw = callback.model_dump(by_alias=True, exclude_none=True)
+    await asyncio.to_thread(runtime.handle, {"update_id": 0, "callback_query": raw})
 
 
 async def dialog_message_input(
