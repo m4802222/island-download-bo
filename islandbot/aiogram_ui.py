@@ -15,7 +15,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
-from aiogram_dialog import Dialog, DialogManager, StartMode, Window, setup_dialogs
+from aiogram_dialog import Dialog, DialogManager, ShowMode, StartMode, Window, setup_dialogs
 from aiogram_dialog.widgets.kbd import Button, Column, Row, Select
 from aiogram_dialog.widgets.input import MessageInput
 from aiogram_dialog.widgets.text import Const, Format
@@ -314,6 +314,10 @@ async def dialog_message_input(
     dialog_manager: DialogManager,
 ) -> None:
     """Keep the active dialog from swallowing ordinary download messages."""
+    # The runtime sends its own progress/confirmation messages.  Editing the
+    # existing UI card prevents aiogram-dialog from replying with a duplicate
+    # generic home card after every resource post.
+    dialog_manager.show_mode = ShowMode.EDIT
     await incoming_message(message, dialog_manager)
 
 
