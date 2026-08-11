@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -36,6 +36,18 @@ class MainSG(StatesGroup):
 
 ACCOUNT_WAITING: set[int] = set()
 router = Router(name="island-download-bot-input")
+legacy_callback_router = Router(name="island-download-bot-legacy-callback")
+
+
+LEGACY_CALLBACK_PATTERN = (
+    r"^(?:"
+    r"account:cancel|home:(?:home|tasks|completed|server)|"
+    r"quarkusecandidate|quarkcancelcandidate|"
+    r"quarkconfirm:.*|quarkedit:.*|quarkcancel:.*|quarkselect:.*|"
+    r"aria:.*|task:.*|action:.*|deleteask:.*|deleteyes:.*|"
+    r"ariaaction:.*|ariadeleteask:.*|ariadeleteyes:.*"
+    r")"
+)
 
 
 def _owner(message: Message | CallbackQuery) -> bool:
@@ -308,11 +320,12 @@ async def incoming_message(message: Message, dialog_manager: DialogManager) -> N
     await asyncio.to_thread(runtime.handle, {"update_id": 0, "message": raw})
 
 
-@router.callback_query()
+@legacy_callback_router.callback_query(F.data.regexp(LEGACY_CALLBACK_PATTERN))
 async def legacy_callback(callback: CallbackQuery) -> None:
     """Forward legacy business buttons (quarkconfirm, category, task, ...)."""
     if not _owner(callback):
         return
+    LOGGER.info("legacy callback received: %s", callback.data or "")
     raw = callback.model_dump(by_alias=True, exclude_none=True)
     await asyncio.to_thread(runtime.handle, {"update_id": 0, "callback_query": raw})
 
@@ -394,6 +407,9 @@ async def _maintenance_loop() -> None:
 async def _run() -> None:
     bot = Bot(token=runtime.TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+    # Legacy business callbacks must run before aiogram-dialog gets a chance
+    # to consume an unknown callback from a runtime-generated keyboard.
+    dp.include_router(legacy_callback_router)
     dp.include_router(dialog)
     setup_dialogs(dp)
     # Messages not consumed by a window's MessageInput are handled by the
