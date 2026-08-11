@@ -11,11 +11,12 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, ExceptionTypeFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ErrorEvent, Message
 from aiogram_dialog import Dialog, DialogManager, ShowMode, StartMode, Window, setup_dialogs
+from aiogram_dialog.api.exceptions import OutdatedIntent, UnknownIntent
 from aiogram_dialog.widgets.kbd import Button, Column, Row, Select
 from aiogram_dialog.widgets.input import MessageInput
 from aiogram_dialog.widgets.text import Const, Format
@@ -59,6 +60,30 @@ async def _answer(callback: CallbackQuery) -> None:
         await callback.answer()
     except Exception:
         pass
+
+
+async def stale_dialog_error(event: ErrorEvent) -> None:
+    """Recover a callback whose dialog context disappeared after a restart.
+
+    aiogram-dialog puts an intent ID in every dialog button.  MemoryStorage is
+    intentionally process-local, so an old Telegram message can outlive the
+    context after a deploy/restart.  The intent middleware raises before a
+    normal callback handler can run; send a fresh legacy home card instead of
+    leaving the user with a silent button and a traceback.
+    """
+    if not isinstance(event.exception, (UnknownIntent, OutdatedIntent)):
+        return
+    callback = event.update.callback_query
+    if not callback or not _owner(callback):
+        return
+    LOGGER.warning("stale dialog intent; resetting menu: %s", event.exception)
+    await _answer(callback)
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    first_name = callback.from_user.first_name or ""
+    try:
+        await asyncio.to_thread(runtime.home, chat_id, first_name)
+    except Exception as exc:
+        LOGGER.exception("stale dialog menu reset failed: %s", exc)
 
 
 def _qbit_row(item: dict) -> dict:
@@ -412,6 +437,13 @@ async def _run() -> None:
     dp.include_router(legacy_callback_router)
     dp.include_router(dialog)
     setup_dialogs(dp)
+    # Intent middleware raises UnknownIntent/OutdatedIntent for buttons from
+    # a pre-restart dialog.  Register after setup_dialogs so the recovery runs
+    # at the dispatcher error boundary instead of crashing polling.
+    dp.errors.register(
+        stale_dialog_error,
+        ExceptionTypeFilter(UnknownIntent, OutdatedIntent),
+    )
     # Messages not consumed by a window's MessageInput are handled by the
     # compatibility router (for example before a dialog has been started).
     dp.include_router(router)
