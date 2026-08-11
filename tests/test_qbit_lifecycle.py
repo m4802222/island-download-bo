@@ -47,6 +47,53 @@ class QBitLifecycleTests(unittest.TestCase):
         )
         save_queue.assert_called_once()
 
+    def test_cloud_gate_pauses_ordinary_task_but_never_brush_task(self):
+        qbit = Mock()
+        tasks = [
+            {
+                "hash": "ordinary",
+                "name": "ordinary",
+                "progress": 0,
+                "state": "downloading",
+                "category": "华语剧集",
+            },
+            {
+                "hash": "brush",
+                "name": "brush",
+                "progress": 0,
+                "state": "downloading",
+                "category": "学校救号",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            block = Path(temp) / "block.json"
+            block.write_text('{"active": true}', encoding="utf-8")
+            service = QBitLifecycle(
+                qbit,
+                lambda: tasks,
+                Mock(),
+                "owner",
+                ["ordinary", "brush"],
+                set(),
+                Mock(),
+                Mock(),
+                True,
+                2,
+                1,
+                Path(temp),
+                block,
+                False,
+                60,
+                Mock(),
+                Mock(),
+            )
+            service.run_queue()
+
+        self.assertEqual(
+            [call.args[:2] for call in qbit.action.call_args_list],
+            [("pause", "ordinary")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

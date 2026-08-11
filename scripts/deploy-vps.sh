@@ -5,7 +5,7 @@ bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
 repository=m4802222/island-download-bo
-ref=${ISLAND_BOT_REF:-v2.5.0}
+ref=${ISLAND_BOT_REF:-v2.6.7}
 archive_url="https://codeload.github.com/$repository/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
@@ -292,6 +292,29 @@ assert SETTINGS.telegram_ui_engine in {"legacy", "aiogram_dialog"}
 fi
 if ! docker exec "$container" rclone --config /rclone/rclone.conf \
     config redacted MP | grep -Fxq 'remote = gdrive2:'; then
+    restore_previous
+fi
+if ! gdrive2_policy=$(docker exec moviepilot rclone config redacted gdrive2); then
+    echo "MoviePilot gdrive2 配置读取失败"
+    restore_previous
+fi
+if ! grep -Fxq 'type = drive' <<<"$gdrive2_policy" ||
+    ! grep -Eq '^client_id = .+' <<<"$gdrive2_policy" ||
+    ! grep -Eq '^team_drive = .+' <<<"$gdrive2_policy" ||
+    ! grep -Fxq 'stop_on_upload_limit = true' <<<"$gdrive2_policy"; then
+    echo "MoviePilot gdrive2 上传策略不完整"
+    restore_previous
+fi
+if ! mp_transfer_threads=$(
+    docker exec moviepilot python -c \
+        'from app.core.config import settings; print(settings.TRANSFER_THREADS)' |
+        grep -E '^[0-9]+$' | tail -n 1
+); then
+    echo "MoviePilot 整理线程读取失败"
+    restore_previous
+fi
+if [ "$mp_transfer_threads" != 1 ]; then
+    echo "MoviePilot 整理线程必须为 1，当前为 ${mp_transfer_threads:-未知}"
     restore_previous
 fi
 

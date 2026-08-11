@@ -39,11 +39,13 @@ Google Drive 的媒体流程。
 - 支持发送 `pan.quark.cn` 分享链接：QAS 转存后将文件直链交给 Aria2，完成后由 MoviePilot 入库 Google Drive
 - 普通中文消息接入本地 Ollama AI 助手；下载与删除仍须使用机器人操作确认
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
-- MoviePilot 的 rclone 上传失败时保留源文件、暂停普通下载；网络错误按 5、15、30、60 分钟递增重试，OAuth 失效不进行高频重试；
-  Google Drive 恢复后自动续传并恢复被系统暂停的任务，刷流任务始终不受影响
+- 上传闸门每分钟执行一次，空闲且健康时每 30 分钟做一次极小写入探测；发现 Google 403、网络或 OAuth 异常后，在下一轮普通媒体上传失败前尽量提前暂停 qB 与 Aria2 普通下载
+- MoviePilot 的 rclone 上传失败时保留源文件；网络错误按 5、15、30、60 分钟递增探测，Google 403 最长退避 6 小时，OAuth 失效不进行高频重试
+- 只有新的写入探测成功后才解除闸门；随后串行重试，且必须同时验证 MoviePilot 成功记录、目标路径存在及源/目标/远端文件大小一致，才允许清理普通任务
+- `学校救号`、`刷流*` 分类以及 `刷流*` 标签始终不暂停、不删除
 - 机器人管理的普通任务连续 30 分钟保持 0% 时自动暂停并通知；AI 问答在后台线程执行，不阻塞下载轮询；可选配置第二个 qBittorrent 做 InfoHash 冲突检查
 - 夸克或种子文件的实际 `SxxEyy` 季数与确认身份不一致时，下载前直接拦截，避免第二季被整理到第一季
-- 每天北京时间 08:00 通过 Telegram 检查磁盘、gdrive1/gdrive2、Google Drive 写入、qB、MoviePilot、Aria2、Emby、mediaunion 挂载和九分类媒体库
+- 每天北京时间 08:00 通过 Telegram 检查磁盘、gdrive1/gdrive2、Google Drive 写入、单上传线程策略、MoviePilot 最近 24 小时写入量、qB、MoviePilot、Aria2、Emby、mediaunion 挂载和九分类媒体库
 - 分类名称直接读取 MoviePilot 的 `category.yaml` 并严格校验“华语 / 日韩 / 海外”
   九分类；qBittorrent 自动补齐对应分类和保存路径，无任务占用时移除旧“欧美”分类
 - 正式九分类文件由仓库 `config/category.yaml` 管理；每次部署先备份 MoviePilot
@@ -113,13 +115,16 @@ TELEGRAM_UI_ENGINE=legacy
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.5.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.6.7/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
 部署脚本会先执行编译和测试，保留上一版源码用于失败回滚，并以目录方式将
 MoviePilot 的 rclone 配置挂载到 `/rclone:rw`，避免 OAuth 刷新后容器仍读取旧文件。
-部署完成后还会安装上传恢复定时器和每日健康检查定时器；上传恢复只重试源文件仍存在的 rclone 上传失败记录。
+部署完成后还会安装上传闸门/恢复定时器和每日健康检查定时器。部署会强制校验
+`MP -> gdrive2:`、gdrive2 的独立 client ID、共享云盘 ID、`stop_on_upload_limit = true`
+以及 MoviePilot 仅有 1 个整理线程；任一条件不满足会自动恢复旧机器人。
+上传恢复只重试源文件仍存在的 rclone 上传失败记录。
 MoviePilot 已移动源文件时会继续阻止新普通下载，直到成功记录与云盘实时文件大小通过验证；
 不会把识别失败或旧成功记录误判为本次上传成功。
 

@@ -1,11 +1,11 @@
 [Unit]
-Description=Check failed MoviePilot rclone transfers every five minutes
+Description=Enforce the MoviePilot Google Drive upload gate every minute
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=5min
-AccuracySec=30s
-RandomizedDelaySec=30s
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=10s
 Persistent=true
 
 [Install]

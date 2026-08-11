@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -21,6 +22,7 @@ DOWNLOADS = Path("/opt/media/downloads")
 MOVIEPILOT_CONTAINER = "moviepilot"
 BOT_CONTAINER = "island-download-bot"
 BLOCK_FILE = BOT_DIR / "data" / "cloud-upload-block.json"
+MOVIEPILOT_DATABASE = Path("/opt/media/moviepilot/config/user.db")
 
 sys.path.insert(0, str(BOT_DIR if BOT_DIR.is_dir() else PROJECT_DIR))
 
@@ -143,6 +145,105 @@ def check_mp_alias() -> tuple[str, str]:
         return "🔴", f"MP 云盘别名：异常 — {output.strip()[-120:] or '未找到'}"
     except (subprocess.TimeoutExpired, OSError) as exc:
         return "🔴", f"MP 云盘别名：检测失败 — {exc}"
+
+
+def check_upload_policy() -> tuple[str, str]:
+    """Confirm the permanent single-uploader and fatal-limit policy."""
+
+    try:
+        remote = run(
+            [
+                "docker", "exec", MOVIEPILOT_CONTAINER,
+                "rclone", "config", "redacted", "gdrive2",
+            ],
+            timeout=10,
+        )
+        threads = run(
+            [
+                "docker", "exec", MOVIEPILOT_CONTAINER, "python", "-c",
+                "from app.core.config import settings; print(settings.TRANSFER_THREADS)",
+            ],
+            timeout=20,
+        )
+        output = remote.stdout + remote.stderr
+        config = {}
+        for line in output.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                config[key.strip()] = value.strip()
+        thread_values = [
+            line.strip()
+            for line in threads.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+        problems = []
+        if remote.returncode != 0 or config.get("type") != "drive":
+            problems.append("gdrive2配置不可读")
+        if not config.get("client_id"):
+            problems.append("未配置独立client_id")
+        if not config.get("team_drive"):
+            problems.append("未配置共享云盘")
+        if config.get("stop_on_upload_limit") != "true":
+            problems.append("上传限制未快速失败")
+        if not thread_values or thread_values[-1] != "1":
+            problems.append("MoviePilot整理线程不是1")
+        if problems:
+            return "🔴", "上传策略：" + "、".join(problems)
+        return "🟢", "上传策略：MoviePilot单线程、403快速转入延迟恢复"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "🔴", f"上传策略：检测失败 — {exc}"
+
+
+def moviepilot_upload_stats(database: Path) -> tuple[int, int, int]:
+    """Return unique successful files, bytes, and rclone failures for 24h."""
+
+    if not database.is_file():
+        raise RuntimeError("MoviePilot整理历史不存在")
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        rows = connection.execute(
+            "SELECT dest, src_fileitem, dest_fileitem FROM transferhistory "
+            "WHERE status = 1 AND datetime(date) >= datetime('now', '-24 hours') "
+            "AND (dest_storage = 'rclone' OR dest LIKE '/Media/%' OR dest LIKE '//Media/%') "
+            "ORDER BY id DESC"
+        ).fetchall()
+        failures = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM transferhistory "
+                "WHERE status = 0 AND datetime(date) >= datetime('now', '-24 hours') "
+                "AND lower(COALESCE(errmsg, '')) LIKE '%rclone%'"
+            ).fetchone()[0]
+        )
+    seen = set()
+    total = 0
+    for destination, source_item, destination_item in rows:
+        destination = str(destination or "")
+        if not destination or destination in seen:
+            continue
+        seen.add(destination)
+        size = 0
+        for value in (destination_item, source_item):
+            try:
+                item = value if isinstance(value, dict) else json.loads(value or "{}")
+                size = int(item.get("size") or 0)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                size = 0
+            if size > 0:
+                break
+        total += size
+    return len(seen), total, failures
+
+
+def check_moviepilot_upload_volume() -> tuple[str, str]:
+    """Expose measured MoviePilot writes without pretending it is account total."""
+
+    try:
+        count, total, failures = moviepilot_upload_stats(MOVIEPILOT_DATABASE)
+    except (RuntimeError, sqlite3.Error) as exc:
+        return "🟡", f"MoviePilot 24小时上传：读取失败 — {exc}"
+    gib = total / 1024**3
+    emoji = "🔴" if gib >= 700 else ("🟡" if gib >= 500 or failures else "🟢")
+    suffix = f"，失败记录 {failures} 条" if failures else ""
+    return emoji, f"MoviePilot 24小时成功写入：{count} 个文件 / {gib:.1f}GiB（仅统计MP）{suffix}"
 
 
 def check_docker_service(container: str, display_name: str) -> tuple[str, str]:
@@ -279,7 +380,7 @@ def check_cloud_categories() -> tuple[str, str]:
     """Confirm the union cloud view exposes all nine canonical directories."""
     try:
         result = run(
-            ["rclone", "lsf", "mediaunion:Media", "--dirs-only", "--max-depth", "1"],
+            ["rclone", "lsf", "mediaunion:", "--dirs-only", "--max-depth", "1"],
             timeout=35,
         )
         names = {line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()}
@@ -389,7 +490,9 @@ def build_report() -> str:
         check_rclone_remote("gdrive1"),
         check_rclone_remote("gdrive2"),
         check_mp_alias(),
+        check_upload_policy(),
         check_rclone_write(),
+        check_moviepilot_upload_volume(),
         check_upload_block(),
         check_pending_retries(),
         ("", ""),  # separator
@@ -452,6 +555,7 @@ def main() -> None:
         choices=[
             "disk", "gdrive1", "gdrive2", "mp", "write", "qbit",
             "moviepilot", "aria2", "emby", "block", "orphan", "retry",
+            "policy", "volume",
         ],
         help="Run a single check and print the result",
     )
@@ -463,7 +567,9 @@ def main() -> None:
             "gdrive1": lambda: check_rclone_remote("gdrive1"),
             "gdrive2": lambda: check_rclone_remote("gdrive2"),
             "mp": check_mp_alias,
+            "policy": check_upload_policy,
             "write": check_rclone_write,
+            "volume": check_moviepilot_upload_volume,
             "qbit": check_qbittorrent,
             "moviepilot": check_moviepilot,
             "aria2": check_aria2,

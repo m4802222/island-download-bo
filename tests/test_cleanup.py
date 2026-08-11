@@ -9,6 +9,9 @@ from islandbot.cleanup import (
 
 
 class CleanupTests(unittest.TestCase):
+    def test_existing_school_rescue_category_is_protected_as_brush(self):
+        self.assertTrue(is_brush_task({"category": "学校救号"}))
+
     def setUp(self):
         self.task = {
             "progress": 1,

@@ -43,9 +43,22 @@ class DeploymentTests(unittest.TestCase):
             ".bak-deploy-",
             "island-health.timer",
             "health-check.py",
+            "stop_on_upload_limit = true",
+            "settings.TRANSFER_THREADS",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, script)
+
+    def test_deploy_defaults_to_the_versioned_release(self):
+        version = (ROOT / "VERSION").read_text().strip()
+        script = (ROOT / "scripts" / "deploy-vps.sh").read_text()
+        self.assertIn(f"ref=${{ISLAND_BOT_REF:-v{version}}}", script)
+
+    def test_upload_gate_timer_checks_every_minute_without_probing_every_minute(self):
+        timer = (ROOT / "scripts" / "moviepilot-rclone-retry.timer").read_text()
+        worker = (ROOT / "scripts" / "retry-moviepilot-rclone.py").read_text()
+        self.assertIn("OnUnitActiveSec=1min", timer)
+        self.assertIn("HEALTHY: (30 * 60,)", worker)
 
     def test_oauth_entrypoint_has_one_whitelisted_remote(self):
         script = (ROOT / "scripts" / "sync-rclone-oauth.sh").read_text()

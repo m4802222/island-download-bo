@@ -40,11 +40,11 @@ from islandbot.transfer_verification import (  # noqa: E402
 )
 
 PROBE_DELAYS = {
-    HEALTHY: 5 * 60,
-    NETWORK: 15 * 60,
-    QUOTA: 30 * 60,
-    AUTH: 30 * 60,
-    UNKNOWN: 30 * 60,
+    HEALTHY: (30 * 60,),
+    NETWORK: (5 * 60, 15 * 60, 30 * 60, 60 * 60),
+    QUOTA: (30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, 6 * 60 * 60),
+    AUTH: (6 * 60 * 60,),
+    UNKNOWN: (30 * 60, 60 * 60, 2 * 60 * 60, 6 * 60 * 60),
 }
 STATUS_TEXT = {
     HEALTHY: "Google Drive 写入检测正常",
@@ -88,6 +88,23 @@ def run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
         timeout=timeout,
         check=False,
     )
+
+
+def moviepilot_upload_active() -> bool:
+    """Avoid probing or retrying alongside MoviePilot's own rclone upload."""
+
+    result = run(
+        [
+            "docker",
+            "exec",
+            MOVIEPILOT_CONTAINER,
+            "pgrep",
+            "-f",
+            "rclone copyto",
+        ],
+        timeout=10,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def cleanup_stale_probes() -> None:
@@ -172,6 +189,40 @@ def probe_remote() -> tuple[str, str]:
         else:
             print("rclone probe cleanup deferred until the next check", flush=True)
     return status, output[-1000:]
+
+
+def probe_delay(status: str, consecutive_failures: int) -> int:
+    """Return a bounded progressive delay for the next backend probe."""
+
+    delays = PROBE_DELAYS.get(status, PROBE_DELAYS[UNKNOWN])
+    index = max(0, consecutive_failures - 1)
+    return delays[min(index, len(delays) - 1)]
+
+
+def refresh_backend(state: dict, now: float) -> tuple[str, bool, str]:
+    """Probe when due and persist the effective Google Drive backend state."""
+
+    backend = state.get("backend") if isinstance(state.get("backend"), dict) else {}
+    old_status = str(backend.get("status") or UNKNOWN)
+    next_probe = float(backend.get("next_probe") or 0)
+    if now < next_probe:
+        return old_status, False, ""
+
+    status, output = probe_remote()
+    old_failures = max(0, int(backend.get("consecutive_failures") or 0))
+    if status == HEALTHY:
+        consecutive_failures = 0
+    elif status == old_status:
+        consecutive_failures = old_failures + 1
+    else:
+        consecutive_failures = 1
+    state["backend"] = {
+        "status": status,
+        "next_probe": now + probe_delay(status, consecutive_failures),
+        "last_probe": now,
+        "consecutive_failures": consecutive_failures,
+    }
+    return status, True, output
 
 
 def remote_destination_size(destination: str) -> int | None:
@@ -383,6 +434,19 @@ def clear_block(block: dict, notification: str | None = None) -> None:
         notify(f"✅ Google Drive 上传通道已恢复\n\n{notification}{suffix}")
 
 
+def activate_block(status: str, block: dict) -> tuple[list[str], list[str]]:
+    """Pause every ordinary in-flight download while preserving brush tasks."""
+
+    already_paused = [str(item) for item in block.get("paused_hashes") or []]
+    newly_paused = _qbit_action("pause")
+    paused_hashes = sorted(set(already_paused + newly_paused))
+    already_paused_aria2 = [str(item) for item in block.get("paused_aria2") or []]
+    newly_paused_aria2 = _aria2_action("pause")
+    paused_aria2 = sorted(set(already_paused_aria2 + newly_paused_aria2))
+    set_block(True, status, paused_hashes, paused_aria2)
+    return paused_hashes, paused_aria2
+
+
 def process(dry_run: bool = False) -> None:
     now = time.time()
     failures, retryable = pending_failures()
@@ -395,35 +459,55 @@ def process(dry_run: bool = False) -> None:
             print(f"#{failure.history_id} {failure.title}: {failure.source}")
         return
 
+    if moviepilot_upload_active():
+        backend = state.get("backend") if isinstance(state.get("backend"), dict) else {}
+        backend["next_probe"] = now + 60
+        state["backend"] = backend
+        if failures or block.get("active"):
+            status = str(block.get("reason") or backend.get("status") or UNKNOWN)
+            activate_block(status, block)
+        save_json(STATE_FILE, state)
+        print("MoviePilot upload active; probe and retry deferred", flush=True)
+        return
+
+    old_backend = state.get("backend") if isinstance(state.get("backend"), dict) else {}
+    old_status = str(old_backend.get("status") or UNKNOWN)
+    status, probed, probe_output = refresh_backend(state, now)
+    if block.get("active") and not probed:
+        # A persisted block is authoritative until a new successful write
+        # probe proves recovery.  Never clear it merely because an older
+        # state file happened to say healthy.
+        status = str(block.get("reason") or status or UNKNOWN)
+    if probed:
+        print(
+            f"rclone probe status={status} "
+            f"output={probe_output[-300:].replace(chr(10), ' | ')}",
+            flush=True,
+        )
+
     if not failures:
+        state["items"] = {}
+        if status != HEALTHY:
+            paused_hashes, paused_aria2 = activate_block(status, block)
+            if not block.get("active"):
+                notify(
+                    "⚠️ Google Drive 主动检测异常，已暂停普通下载\n\n"
+                    f"状态：{STATUS_TEXT[status]}\n"
+                    f"已暂停普通下载：{len(paused_hashes) + len(paused_aria2)} 个\n"
+                    "尚未发生新的入库失败；刷流任务不会暂停或删除。"
+                )
+            elif probed and status != old_status:
+                notify(f"ℹ️ Google Drive 状态变化\n\n{STATUS_TEXT[status]}")
+            save_json(STATE_FILE, state)
+            print(f"Upload gate blocked: {STATUS_TEXT[status]}", flush=True)
+            return
         if block.get("active"):
-            clear_block(block, "待处理上传已经全部成功或源文件已不再存在。")
+            clear_block(block, "写入探测已经恢复，且没有待处理失败文件。")
         else:
             set_block(False, HEALTHY, [], [])
-        state["items"] = {}
-        state["backend"] = {
-            "status": HEALTHY,
-            "next_probe": now + PROBE_DELAYS[HEALTHY],
-        }
         save_json(STATE_FILE, state)
         print("No pending rclone upload failures", flush=True)
         return
-
-    backend = state.get("backend") if isinstance(state.get("backend"), dict) else {}
-    old_status = str(backend.get("status") or UNKNOWN)
-    status = old_status
-    if now >= float(backend.get("next_probe") or 0):
-        status, probe_output = probe_remote()
-        backend = {
-            "status": status,
-            "next_probe": now + PROBE_DELAYS[status],
-            "last_probe": now,
-        }
-        print(
-            f"rclone probe status={status} output={probe_output[-300:].replace(chr(10), ' | ')}",
-            flush=True,
-        )
-    state["backend"] = backend
 
     due, state, new = update_retry_state(
         failures,
@@ -434,13 +518,7 @@ def process(dry_run: bool = False) -> None:
         retryable_sources=retryable,
     )
 
-    already_paused = [str(item) for item in block.get("paused_hashes") or []]
-    newly_paused = _qbit_action("pause")
-    paused_hashes = sorted(set(already_paused + newly_paused))
-    already_paused_aria2 = [str(item) for item in block.get("paused_aria2") or []]
-    newly_paused_aria2 = _aria2_action("pause")
-    paused_aria2 = sorted(set(already_paused_aria2 + newly_paused_aria2))
-    set_block(True, status, paused_hashes, paused_aria2)
+    paused_hashes, paused_aria2 = activate_block(status, block)
 
     if not block.get("active"):
         titles = "、".join(item.title for item in list(failures.values())[:3])
@@ -464,6 +542,9 @@ def process(dry_run: bool = False) -> None:
 
     redo_succeeded = []
     for failure in due:
+        if moviepilot_upload_active():
+            print("MoviePilot upload became active; remaining retries deferred", flush=True)
+            break
         success, message = redo(failure.history_id)
         attempts = int(state["items"][failure.source].get("attempts") or 0)
         print(

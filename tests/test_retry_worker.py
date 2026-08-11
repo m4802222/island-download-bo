@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from islandbot.retry import HEALTHY
+from islandbot.retry import HEALTHY, NETWORK, QUOTA
 from islandbot.retry import TransferFailure
 from islandbot.transfer_verification import TransferProof
 
@@ -49,6 +49,96 @@ class RetryWorkerTests(unittest.TestCase):
         self.assertEqual(status, HEALTHY)
         self.assertEqual(delete.call_count, 2)
         sleep.assert_called_once_with(3)
+
+    def test_probe_backoff_is_progressive_and_bounded(self):
+        self.assertEqual(WORKER.probe_delay(NETWORK, 1), 5 * 60)
+        self.assertEqual(WORKER.probe_delay(NETWORK, 2), 15 * 60)
+        self.assertEqual(WORKER.probe_delay(NETWORK, 99), 60 * 60)
+        self.assertEqual(WORKER.probe_delay(QUOTA, 1), 30 * 60)
+        self.assertEqual(WORKER.probe_delay(QUOTA, 99), 6 * 60 * 60)
+
+    def test_no_failure_quota_probe_activates_global_gate(self):
+        state = {"backend": {"status": HEALTHY, "next_probe": 0}}
+        with (
+            mock.patch.object(WORKER, "pending_failures", return_value=({}, set())),
+            mock.patch.object(WORKER, "load_json", return_value=state),
+            mock.patch.object(WORKER, "cloud_block_status", return_value={}),
+            mock.patch.object(WORKER, "moviepilot_upload_active", return_value=False),
+            mock.patch.object(WORKER, "probe_remote", return_value=(QUOTA, "403")),
+            mock.patch.object(
+                WORKER, "activate_block", return_value=(["ordinary"], ["aria"])
+            ) as activate,
+            mock.patch.object(WORKER, "notify") as notify,
+            mock.patch.object(WORKER, "save_json") as save,
+        ):
+            WORKER.process()
+        activate.assert_called_once_with(QUOTA, {})
+        self.assertIn("主动检测异常", notify.call_args.args[0])
+        self.assertEqual(state["backend"]["status"], QUOTA)
+        save.assert_called()
+
+    def test_no_failure_block_clears_only_after_healthy_probe(self):
+        block = {"active": True, "reason": QUOTA}
+        state = {"backend": {"status": QUOTA, "next_probe": 0}}
+        with (
+            mock.patch.object(WORKER, "pending_failures", return_value=({}, set())),
+            mock.patch.object(WORKER, "load_json", return_value=state),
+            mock.patch.object(WORKER, "cloud_block_status", return_value=block),
+            mock.patch.object(WORKER, "moviepilot_upload_active", return_value=False),
+            mock.patch.object(WORKER, "probe_remote", return_value=(HEALTHY, "")),
+            mock.patch.object(WORKER, "clear_block") as clear,
+            mock.patch.object(WORKER, "activate_block") as activate,
+            mock.patch.object(WORKER, "save_json"),
+        ):
+            WORKER.process()
+        clear.assert_called_once()
+        activate.assert_not_called()
+
+    def test_persisted_block_cannot_clear_without_a_new_probe(self):
+        block = {"active": True, "reason": QUOTA}
+        state = {
+            "backend": {
+                "status": HEALTHY,
+                "next_probe": 9999999999,
+            }
+        }
+        with (
+            mock.patch.object(WORKER, "pending_failures", return_value=({}, set())),
+            mock.patch.object(WORKER, "load_json", return_value=state),
+            mock.patch.object(WORKER, "cloud_block_status", return_value=block),
+            mock.patch.object(WORKER, "moviepilot_upload_active", return_value=False),
+            mock.patch.object(WORKER, "probe_remote") as probe,
+            mock.patch.object(WORKER, "activate_block", return_value=([], [])) as activate,
+            mock.patch.object(WORKER, "clear_block") as clear,
+            mock.patch.object(WORKER, "save_json"),
+        ):
+            WORKER.process()
+        probe.assert_not_called()
+        activate.assert_called_once_with(QUOTA, block)
+        clear.assert_not_called()
+
+    def test_active_moviepilot_upload_defers_probe_and_retry(self):
+        failure = self.failure()
+        state = {"backend": {"status": HEALTHY, "next_probe": 0}}
+        block = {"active": True, "reason": QUOTA}
+        with (
+            mock.patch.object(
+                WORKER,
+                "pending_failures",
+                return_value=({failure.source: failure}, {failure.source}),
+            ),
+            mock.patch.object(WORKER, "load_json", return_value=state),
+            mock.patch.object(WORKER, "cloud_block_status", return_value=block),
+            mock.patch.object(WORKER, "moviepilot_upload_active", return_value=True),
+            mock.patch.object(WORKER, "activate_block") as activate,
+            mock.patch.object(WORKER, "probe_remote") as probe,
+            mock.patch.object(WORKER, "redo") as redo,
+            mock.patch.object(WORKER, "save_json"),
+        ):
+            WORKER.process()
+        activate.assert_called_once_with(QUOTA, block)
+        probe.assert_not_called()
+        redo.assert_not_called()
 
     def test_remote_destination_size_requires_file_stat(self):
         response = subprocess.CompletedProcess(

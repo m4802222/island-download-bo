@@ -13,6 +13,9 @@ from collections.abc import Iterable
 from .media import VIDEO_EXTENSIONS
 
 
+PROTECTED_BRUSH_CATEGORIES = frozenset({"学校救号"})
+
+
 def is_brush_task(task: dict) -> bool:
     """Keep qBittorrent traffic-boosting tasks even after media transfer."""
 
@@ -22,7 +25,11 @@ def is_brush_task(task: dict) -> bool:
         for tag in str(task.get("tags") or "").split(",")
         if tag.strip()
     }
-    return category.startswith("刷流") or any(tag.startswith("刷流") for tag in tags)
+    return (
+        category.startswith("刷流")
+        or category in PROTECTED_BRUSH_CATEGORIES
+        or any(tag.startswith("刷流") for tag in tags)
+    )
 
 
 def normalize_path(value: object) -> str:
