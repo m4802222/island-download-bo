@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ from ..retry import AUTH, HEALTHY, NETWORK, QUOTA, UNKNOWN, classify_probe_error
 
 
 ALLOWED_DRIVES = ("gdrive1", "gdrive2")
+PROBE_PREFIX = ".islandbot-ui-probe"
+DELETE_DELAYS = (3, 10, 30)
 _SECTION = re.compile(r"^[ \t]*\[([^\]\r\n]+)\][ \t]*(?:[;#].*)?(?:\r?\n)?$")
 _TYPE = re.compile(r"^[ \t]*type[ \t]*=[ \t]*(.*?)[ \t]*(?:\r?\n)?$")
 _REMOTE = re.compile(r"^[ \t]*remote[ \t]*=[ \t]*(.*?)[ \t]*(?:\r?\n)?$")
@@ -51,9 +54,10 @@ class CloudDriveControl:
         UNKNOWN: "未知写入错误",
     }
 
-    def __init__(self, config: Path, runner=subprocess.run):
+    def __init__(self, config: Path, runner=subprocess.run, sleeper=time.sleep):
         self.config = Path(config)
         self.runner = runner
+        self.sleeper = sleeper
         self._lock = threading.RLock()
 
     @staticmethod
@@ -125,10 +129,39 @@ class CloudDriveControl:
         except OSError as exc:
             return subprocess.CompletedProcess(command, 127, "", str(exc))
 
+    def _cleanup_stale_probes(self, remote: str) -> None:
+        """Best-effort cleanup restricted to old UI probe files at remote root."""
+
+        self._run(
+            [
+                "rclone", "--config", str(self.config), "delete", f"{remote}:/",
+                "--include", f"{PROBE_PREFIX}-*.txt",
+                "--max-depth", "1", "--min-age", "1m",
+                "--retries", "1", "--low-level-retries", "1",
+            ],
+            40,
+        )
+
+    def _delete_probe_when_visible(self, destination: str) -> bool:
+        for delay in DELETE_DELAYS:
+            self.sleeper(delay)
+            result = self._run(
+                [
+                    "rclone", "--config", str(self.config), "deletefile", destination,
+                    "--contimeout", "10s", "--timeout", "20s",
+                    "--retries", "1", "--low-level-retries", "1",
+                ],
+                30,
+            )
+            if result.returncode == 0:
+                return True
+        return False
+
     def _probe(self, remote: str) -> ProbeResult:
         if remote not in ALLOWED_DRIVES:
             raise RuntimeError("只允许检测 gdrive1 或 gdrive2")
-        name = f".islandbot-ui-probe-{uuid.uuid4().hex}.txt"
+        self._cleanup_stale_probes(remote)
+        name = f"{PROBE_PREFIX}-{uuid.uuid4().hex}.txt"
         destination = f"{remote}:/{name}"
         descriptor, local_name = tempfile.mkstemp(prefix="islandbot-drive-probe-")
         cleaned = False
@@ -149,15 +182,8 @@ class CloudDriveControl:
             )
             output = "\n".join(part for part in (result.stdout, result.stderr) if part)
             status = classify_probe_error(output, result.returncode)
-            delete = self._run(
-                [
-                    "rclone", "--config", str(self.config), "deletefile", destination,
-                    "--contimeout", "10s", "--timeout", "20s",
-                    "--retries", "1", "--low-level-retries", "1",
-                ],
-                30,
-            )
-            cleaned = delete.returncode == 0
+            if status == HEALTHY:
+                cleaned = self._delete_probe_when_visible(destination)
             if status == HEALTHY and not cleaned:
                 status = UNKNOWN
                 detail = "写入成功但测试文件删除失败"
