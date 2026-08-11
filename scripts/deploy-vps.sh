@@ -5,7 +5,7 @@ bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
 repository=m4802222/island-download-bo
-ref=${ISLAND_BOT_REF:-v2.7.0}
+ref=${ISLAND_BOT_REF:-v2.7.1}
 archive_url="https://codeload.github.com/$repository/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
@@ -14,6 +14,7 @@ backup="${container}-prev-$stamp"
 source_backup="$bot_dir/source-prev-$stamp.tar.gz"
 previous_package="$bot_dir/islandbot.previous-$stamp"
 category_target=/opt/media/moviepilot/config/category.yaml
+rclone_target=/opt/media/moviepilot/config/rclone/rclone.conf
 category_backup="${category_target}.bak-deploy-${stamp}"
 category_changed=false
 trap 'rm -rf "$workdir"' EXIT
@@ -22,6 +23,7 @@ trap 'rm -rf "$workdir"' EXIT
 test -f "$bot_dir/.env"
 test -f /opt/media/aria2/.env
 test -s "$category_target"
+test -s "$rclone_target"
 docker inspect "$container" >/dev/null
 
 curl -fsSL --retry 3 "$archive_url" |
@@ -39,6 +41,21 @@ commit=$(
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
 python3 -m py_compile "$workdir/simplebot.py" "$workdir"/islandbot/*.py "$workdir/scripts/health-check.py"
 (cd "$workdir" && python3 -m unittest discover -s tests -v)
+
+if ! mp_remote=$(
+    PYTHONPATH="$workdir" python3 - "$rclone_target" <<'PY'
+import sys
+from pathlib import Path
+
+from islandbot.services.cloud_drive_control import CloudDriveControl
+
+print(CloudDriveControl(Path(sys.argv[1])).current())
+PY
+); then
+    echo "MoviePilot MP 配置无效，旧机器人仍在运行"
+    exit 1
+fi
+echo "MoviePilot MP 当前指向 $mp_remote"
 
 source_items=(simplebot.py Dockerfile)
 had_requirements=false
@@ -290,9 +307,16 @@ assert SETTINGS.telegram_ui_engine in {"legacy", "aiogram_dialog"}
 '; then
     restore_previous
 fi
-if ! docker exec "$container" rclone --config /rclone/rclone.conf \
-    config redacted MP | grep -Eq '^remote = gdrive(1|2):$'; then
-    echo "MoviePilot MP 只能指向 gdrive1 或 gdrive2"
+if ! deployed_mp_remote=$(docker exec "$container" python -c '
+from pathlib import Path
+from islandbot.services.cloud_drive_control import CloudDriveControl
+print(CloudDriveControl(Path("/rclone/rclone.conf")).current())
+'); then
+    echo "MoviePilot MP 配置部署后校验失败"
+    restore_previous
+fi
+if [ "$deployed_mp_remote" != "$mp_remote" ]; then
+    echo "MoviePilot MP 配置在部署期间发生变化"
     restore_previous
 fi
 if ! gdrive2_policy=$(docker exec moviepilot rclone config redacted gdrive2); then

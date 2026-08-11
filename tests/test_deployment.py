@@ -63,9 +63,15 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("send(OWNER,sys.argv[1])", worker)
         self.assertNotIn("send_temporary(OWNER,sys.argv[1])", worker)
 
-    def test_deploy_accepts_only_the_two_known_mp_targets(self):
+    def test_deploy_validates_mp_with_the_dedicated_config_parser(self):
         script = (ROOT / "scripts" / "deploy-vps.sh").read_text()
-        self.assertIn("^remote = gdrive(1|2):$", script)
+        self.assertIn("CloudDriveControl(Path(sys.argv[1])).current()", script)
+        self.assertIn('CloudDriveControl(Path("/rclone/rclone.conf")).current()', script)
+        self.assertNotIn("^remote = gdrive(1|2):$", script)
+        self.assertLess(
+            script.index("MoviePilot MP 当前指向"),
+            script.index('docker stop "$container"'),
+        )
 
     def test_oauth_entrypoint_has_one_whitelisted_remote(self):
         script = (ROOT / "scripts" / "sync-rclone-oauth.sh").read_text()
