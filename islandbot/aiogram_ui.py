@@ -32,6 +32,8 @@ class MainSG(StatesGroup):
     task = State()
     delete = State()
     status = State()
+    drive = State()
+    drive_confirm = State()
     account = State()
 
 
@@ -43,6 +45,7 @@ legacy_callback_router = Router(name="island-download-bot-legacy-callback")
 LEGACY_CALLBACK_PATTERN = (
     r"^(?:"
     r"account:cancel|home:(?:home|tasks|completed|server)|"
+    r"drive:(?:open|check|switchask:(?:gdrive1|gdrive2)|switch:(?:gdrive1|gdrive2))|"
     r"quarkusecandidate|quarkcancelcandidate|"
     r"quarkconfirm:.*|quarkedit:.*|quarkcancel:.*|quarkselect:.*|"
     r"aria:.*|task:.*|action:.*|deleteask:.*|deleteyes:.*|"
@@ -188,6 +191,21 @@ async def status_getter(**_: object) -> dict:
     return {"status_text": text}
 
 
+async def drive_getter(dialog_manager: DialogManager, **_: object) -> dict:
+    view = await asyncio.to_thread(runtime.cloud_drive_view)
+    notice = str(dialog_manager.dialog_data.pop("drive_notice", "") or "")
+    return {
+        "drive_text": await asyncio.to_thread(runtime.cloud_drive_text, notice),
+        "drive_target": view["target"],
+    }
+
+
+async def drive_confirm_getter(dialog_manager: DialogManager, **_: object) -> dict:
+    view = await asyncio.to_thread(runtime.cloud_drive_view)
+    target = str(dialog_manager.dialog_data.get("drive_target") or view["target"])
+    return {"drive_current": view["current"], "drive_target": target}
+
+
 async def go_home(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
     await _answer(callback)
     await manager.switch_to(MainSG.home)
@@ -201,6 +219,41 @@ async def open_tasks(callback: CallbackQuery, _: Button, manager: DialogManager)
 async def open_status(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
     await _answer(callback)
     await manager.switch_to(MainSG.status)
+
+
+async def open_drive(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
+    await _answer(callback)
+    await manager.switch_to(MainSG.drive)
+
+
+async def check_drive(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
+    await _answer(callback)
+    try:
+        result = await asyncio.to_thread(runtime.CLOUD_DRIVE_CONTROL.probe_current)
+        notice = runtime.CLOUD_DRIVE_CONTROL.probe_message(result)
+    except Exception as exc:
+        notice = f"❌ 云盘检测失败：{str(exc)[:160]}"
+    manager.dialog_data["drive_notice"] = notice
+    await manager.switch_to(MainSG.drive)
+
+
+async def ask_drive_switch(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
+    await _answer(callback)
+    view = await asyncio.to_thread(runtime.cloud_drive_view)
+    manager.dialog_data["drive_target"] = view["target"]
+    await manager.switch_to(MainSG.drive_confirm)
+
+
+async def confirm_drive_switch(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
+    await _answer(callback)
+    target = str(manager.dialog_data.get("drive_target") or "")
+    try:
+        result = await asyncio.to_thread(runtime.CLOUD_DRIVE_CONTROL.switch, target)
+        notice = runtime.CLOUD_DRIVE_CONTROL.switch_message(result)
+    except Exception as exc:
+        notice = f"❌ 云盘切换未完成，请刷新确认当前云盘：{str(exc)[:130]}"
+    manager.dialog_data["drive_notice"] = notice
+    await manager.switch_to(MainSG.drive)
 
 
 async def open_account(callback: CallbackQuery, _: Button, manager: DialogManager) -> None:
@@ -376,7 +429,10 @@ dialog = Dialog(
             Button(Const("👤 开号"), id="account", on_click=open_account),
             Button(Const("📋 我的任务"), id="tasks", on_click=open_tasks),
         ),
-        Button(Const("🖥 状态与设置"), id="status", on_click=open_status),
+        Row(
+            Button(Const("🖥 状态与设置"), id="status", on_click=open_status),
+            Button(Const("☁️ 云盘控制"), id="drive", on_click=open_drive),
+        ),
         state=MainSG.home,
     ),
     Window(
@@ -405,9 +461,34 @@ dialog = Dialog(
     Window(
         Format("{status_text}"),
         MessageInput(dialog_message_input),
+        Button(Const("☁️ 云盘控制"), id="drive", on_click=open_drive),
         Row(Button(Const("刷新"), id="refresh", on_click=open_status), Button(Const("← 主菜单"), id="home", on_click=go_home)),
         state=MainSG.status,
         getter=status_getter,
+    ),
+    Window(
+        Format("{drive_text}"),
+        MessageInput(dialog_message_input),
+        Row(
+            Button(Const("🧪 检测当前云盘"), id="check", on_click=check_drive),
+            Button(Format("切换到 {drive_target}"), id="switch", on_click=ask_drive_switch),
+        ),
+        Row(Button(Const("刷新"), id="refresh", on_click=open_drive), Button(Const("← 状态与设置"), id="back", on_click=open_status)),
+        state=MainSG.drive,
+        getter=drive_getter,
+    ),
+    Window(
+        Format(
+            "确认从 {drive_current} 切换到 {drive_target} 吗？\n\n"
+            "系统会先检测目标云盘；写入失败时不会切换。"
+        ),
+        MessageInput(dialog_message_input),
+        Row(
+            Button(Const("确认切换"), id="yes", on_click=confirm_drive_switch),
+            Button(Const("取消"), id="no", on_click=open_drive),
+        ),
+        state=MainSG.drive_confirm,
+        getter=drive_confirm_getter,
     ),
     Window(
         Const("👤 开号\n\n请输入新 Emby 用户名。\n密码使用系统默认值，仅有普通观看权限。\n输入 /cancel 可取消。"),

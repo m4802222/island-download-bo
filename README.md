@@ -3,7 +3,7 @@
 私人 Telegram 下载机器人，面向 QAS、Aria2、qBittorrent、MoviePilot 和
 Google Drive 的媒体流程。
 
-当前稳定版本：`v2.5.0`。
+当前稳定版本：`v2.7.0`。
 
 ## 2.0 重构重点
 
@@ -28,6 +28,8 @@ Google Drive 的媒体流程。
 - 磁力链接或 Telegram 上传的 `.torrent` 种子文件，分类后添加到 qBittorrent
 - 支持“智能分类”：不指定下载器分类，由 MoviePilot 按媒体元数据和现有规则整理
 - 极简主页：Emby 开号、任务、服务器状态
+- 主页提供独立“☁️ 云盘控制”：实时显示 MoviePilot 当前使用 `gdrive1` 或
+  `gdrive2`，可检测当前云盘写入；切换前先验证目标盘写入，失败时不修改 `MP` 别名
 - 仅机器人所有者可用“开号”：输入用户名即创建普通观看账号，默认密码
   `123456`，自动关闭管理、删除、下载、字幕管理和共享权限
 - 任务详情、暂停、继续、二次确认删除
@@ -100,6 +102,7 @@ TELEGRAM_UI_ENGINE=legacy
 - `islandbot/services/normalizer.py`：已完成任务的裸集数规范化和 staging 晋级。
 - `islandbot/services/qbit_lifecycle.py`：qB 队列限流、卡死暂停和验证后清理。
 - `islandbot/services/drive.py`：Google Drive/rclone 查询和目标文件大小验证。
+- `islandbot/services/cloud_drive_control.py`：独立的 MP 云盘显示、写入探测和安全切换。
 - `islandbot/services/transfer.py`：MoviePilot 历史与上传成功证明读取。
 - `islandbot/services/quark.py`：QAS 夸克接口、目录遍历和缺集计划。
 - `islandbot/services/telegram_ui.py`：Telegram 消息、临时提示、按钮和回调确认。
@@ -116,7 +119,7 @@ TELEGRAM_UI_ENGINE=legacy
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.6.9/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.7.0/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 

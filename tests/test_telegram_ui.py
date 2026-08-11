@@ -26,6 +26,12 @@ class TelegramUITests(unittest.TestCase):
             "answerCallbackQuery", {"callback_query_id": "callback-id"}
         )
 
+    def test_home_has_standalone_cloud_drive_button(self):
+        ui = TelegramUI(Mock(), [], Mock(), Mock(), lambda: [], lambda: 2)
+        buttons = [item for row in ui.home_keyboard() for item in row]
+        cloud = [item for item in buttons if item["callback_data"] == "drive:open"]
+        self.assertEqual([item["text"] for item in cloud], ["☁️ 云盘控制"])
+
 
 if __name__ == "__main__":
     unittest.main()

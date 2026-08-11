@@ -45,6 +45,32 @@ class HandlerTests(unittest.TestCase):
         self.assertTrue(handlers.legacy_command(1, "/tasks"))
         runtime.show_tasks.assert_called_once_with(1)
 
+    def test_cloud_drive_callbacks_use_dedicated_runtime_actions(self):
+        runtime = self._runtime()
+        runtime.cloud_drive_screen = Mock()
+        runtime.cloud_drive_probe = Mock()
+        runtime.cloud_drive_confirm = Mock()
+        runtime.cloud_drive_switch = Mock()
+        handlers = BotHandlers(lambda: runtime)
+
+        def callback(data):
+            return {
+                "id": "callback",
+                "from": {"id": 1},
+                "message": {"chat": {"id": 9}, "message_id": 10},
+                "data": data,
+            }
+
+        handlers.handle_callback(callback("drive:open"))
+        handlers.handle_callback(callback("drive:check"))
+        handlers.handle_callback(callback("drive:switchask:gdrive2"))
+        handlers.handle_callback(callback("drive:switch:gdrive2"))
+
+        runtime.cloud_drive_screen.assert_called_once_with(9)
+        runtime.cloud_drive_probe.assert_called_once_with(9)
+        runtime.cloud_drive_confirm.assert_called_once_with(9, "gdrive2")
+        runtime.cloud_drive_switch.assert_called_once_with(9, "gdrive2")
+
 
 if __name__ == "__main__":
     unittest.main()

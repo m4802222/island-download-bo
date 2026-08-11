@@ -98,7 +98,10 @@ class TelegramUI:
                 {"text": "👤 开号", "callback_data": "account:create"},
                 {"text": "📋 我的任务", "callback_data": "home:tasks"},
             ],
-            [{"text": "🖥 状态与设置", "callback_data": "home:server"}],
+            [
+                {"text": "🖥 状态与设置", "callback_data": "home:server"},
+                {"text": "☁️ 云盘控制", "callback_data": "drive:open"},
+            ],
         ]
 
     def category_keyboard(self):

@@ -76,6 +76,14 @@ class BotHandlers:
             return r.show_recent_completed(chat_id)
         if data == "home:server":
             return r.server_status(chat_id)
+        if data == "drive:open":
+            return r.cloud_drive_screen(chat_id)
+        if data == "drive:check":
+            return r.cloud_drive_probe(chat_id)
+        if data.startswith("drive:switchask:"):
+            return r.cloud_drive_confirm(chat_id, data.rsplit(":", 1)[1])
+        if data.startswith("drive:switch:"):
+            return r.cloud_drive_switch(chat_id, data.rsplit(":", 1)[1])
         if data == "quarkusecandidate":
             pending = r.QUARK_TITLE_PENDING.get(str(chat_id))
             if not pending or not pending.get("candidate"):

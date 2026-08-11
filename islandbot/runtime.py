@@ -42,6 +42,7 @@ from .storage import IdentityStore, JsonStore
 from .services.normalizer import EpisodeNormalizer
 from .services.qbit_lifecycle import QBitLifecycle
 from .services.drive import DriveService
+from .services.cloud_drive_control import CloudDriveControl
 from .services.quark import QuarkService
 from .services.transfer import TransferService
 from .services.telegram_ui import TelegramUI
@@ -56,6 +57,7 @@ from .parsing import (
 
 SETTINGS = Settings.from_env()
 DRIVE_SERVICE = DriveService(SETTINGS.rclone_config, SETTINGS.drive_remote)
+CLOUD_DRIVE_CONTROL = CloudDriveControl(SETTINGS.rclone_config)
 TRANSFER_SERVICE = TransferService(SETTINGS.moviepilot_db)
 TOKEN = SETTINGS.bot_token
 OWNER = SETTINGS.owner_id
@@ -1115,8 +1117,78 @@ def server_status(chat_id):
     send(
         chat_id,
         server_status_text(),
-        [[{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}]],
+        [
+            [{"text": "☁️ 云盘控制", "callback_data": "drive:open"}],
+            [{"text": "刷新", "callback_data": "home:server"}, {"text": "← 主菜单", "callback_data": "home:home"}],
+        ],
     )
+
+
+def cloud_drive_view():
+    """Return the live MP alias selection from the shared rclone config."""
+    return CLOUD_DRIVE_CONTROL.view()
+
+
+def cloud_drive_text(notice=None):
+    view = cloud_drive_view()
+    text = (
+        "☁️ 云盘控制\n\n"
+        f"MoviePilot 当前入库：{view['current']}\n"
+        f"可切换到：{view['target']}\n\n"
+        "切换前会先验证目标云盘写入。\n"
+        "只影响之后的新入库，不会移动已有文件。"
+    )
+    if notice:
+        text += f"\n\n{notice}"
+    return text
+
+
+def cloud_drive_keyboard():
+    view = cloud_drive_view()
+    return [
+        [
+            {"text": "🧪 检测当前云盘", "callback_data": "drive:check"},
+            {"text": f"切换到 {view['target']}", "callback_data": f"drive:switchask:{view['target']}"},
+        ],
+        [{"text": "刷新", "callback_data": "drive:open"}, {"text": "← 状态与设置", "callback_data": "home:server"}],
+    ]
+
+
+def cloud_drive_screen(chat_id, notice=None):
+    return send(chat_id, cloud_drive_text(notice), cloud_drive_keyboard())
+
+
+def cloud_drive_probe(chat_id):
+    try:
+        result = CLOUD_DRIVE_CONTROL.probe_current()
+        notice = CLOUD_DRIVE_CONTROL.probe_message(result)
+    except Exception as exc:
+        notice = f"❌ 云盘检测失败：{str(exc)[:160]}"
+    return cloud_drive_screen(chat_id, notice)
+
+
+def cloud_drive_confirm(chat_id, target):
+    view = cloud_drive_view()
+    if target != view["target"]:
+        return cloud_drive_screen(chat_id, "⚠️ 当前云盘已变化，请重新选择。")
+    return send(
+        chat_id,
+        f"确认从 {view['current']} 切换到 {target} 吗？\n\n"
+        "系统会先检测目标云盘；写入失败时不会切换。",
+        [[
+            {"text": "确认切换", "callback_data": f"drive:switch:{target}"},
+            {"text": "取消", "callback_data": "drive:open"},
+        ]],
+    )
+
+
+def cloud_drive_switch(chat_id, target):
+    try:
+        result = CLOUD_DRIVE_CONTROL.switch(target)
+        notice = CLOUD_DRIVE_CONTROL.switch_message(result)
+    except Exception as exc:
+        notice = f"❌ 云盘切换未完成，请刷新确认当前云盘：{str(exc)[:130]}"
+    return cloud_drive_screen(chat_id, notice)
 
 
 def service_tick():
