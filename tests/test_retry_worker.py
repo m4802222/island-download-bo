@@ -123,6 +123,7 @@ class RetryWorkerTests(unittest.TestCase):
             mock.patch.object(WORKER, "load_json", return_value=state),
             mock.patch.object(WORKER, "cloud_block_status", return_value={}),
             mock.patch.object(WORKER, "moviepilot_upload_active", return_value=False),
+            mock.patch.object(WORKER, "monitor_gdrive2_recovery"),
             mock.patch.object(WORKER, "probe_remote", return_value=(QUOTA, "403")),
             mock.patch.object(
                 WORKER, "activate_block", return_value=(["ordinary"], ["aria"])
@@ -144,6 +145,7 @@ class RetryWorkerTests(unittest.TestCase):
             mock.patch.object(WORKER, "load_json", return_value=state),
             mock.patch.object(WORKER, "cloud_block_status", return_value=block),
             mock.patch.object(WORKER, "moviepilot_upload_active", return_value=False),
+            mock.patch.object(WORKER, "monitor_gdrive2_recovery"),
             mock.patch.object(WORKER, "probe_remote", return_value=(HEALTHY, "")),
             mock.patch.object(WORKER, "clear_block") as clear,
             mock.patch.object(WORKER, "activate_block") as activate,
@@ -166,6 +168,7 @@ class RetryWorkerTests(unittest.TestCase):
             mock.patch.object(WORKER, "load_json", return_value=state),
             mock.patch.object(WORKER, "cloud_block_status", return_value=block),
             mock.patch.object(WORKER, "moviepilot_upload_active", return_value=False),
+            mock.patch.object(WORKER, "monitor_gdrive2_recovery"),
             mock.patch.object(WORKER, "probe_remote") as probe,
             mock.patch.object(WORKER, "activate_block", return_value=([], [])) as activate,
             mock.patch.object(WORKER, "clear_block") as clear,

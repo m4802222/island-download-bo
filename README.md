@@ -116,7 +116,7 @@ TELEGRAM_UI_ENGINE=legacy
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.6.8/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.6.9/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
