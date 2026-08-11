@@ -133,7 +133,7 @@ def check_rclone_write() -> tuple[str, str]:
 
 
 def check_mp_alias() -> tuple[str, str]:
-    """Confirm MoviePilot's MP alias still targets gdrive2 only."""
+    """Report the normal gdrive2 target or an explicit gdrive1 fallback."""
     try:
         result = run(
             ["docker", "exec", MOVIEPILOT_CONTAINER, "rclone", "config", "redacted", "MP"],
@@ -142,6 +142,8 @@ def check_mp_alias() -> tuple[str, str]:
         output = result.stdout + result.stderr
         if result.returncode == 0 and "type = alias" in output and "remote = gdrive2:" in output:
             return "🟢", "MP 云盘别名：指向 gdrive2"
+        if result.returncode == 0 and "type = alias" in output and "remote = gdrive1:" in output:
+            return "🟡", "MP 云盘别名：临时回退至 gdrive1"
         return "🔴", f"MP 云盘别名：异常 — {output.strip()[-120:] or '未找到'}"
     except (subprocess.TimeoutExpired, OSError) as exc:
         return "🔴", f"MP 云盘别名：检测失败 — {exc}"

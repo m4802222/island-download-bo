@@ -20,6 +20,8 @@ LOCK_FILE = BOT_DIR / "data" / "rclone_retry.lock"
 BLOCK_FILE = BOT_DIR / "data" / "cloud-upload-block.json"
 MOVIEPILOT_CONTAINER = "moviepilot"
 BOT_CONTAINER = "island-download-bot"
+RECOVERY_REMOTE = "gdrive2"
+RECOVERY_PROBE_PREFIX = ".islandbot-gdrive2-recovery-probe"
 
 sys.path.insert(0, str(BOT_DIR))
 
@@ -107,7 +109,10 @@ def moviepilot_upload_active() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-def cleanup_stale_probes() -> None:
+def cleanup_stale_probes(
+    remote_name: str = "MP",
+    prefix: str = ".islandbot-rclone-probe",
+) -> None:
     """Remove only old files created by this worker's write probes."""
 
     result = run(
@@ -117,9 +122,9 @@ def cleanup_stale_probes() -> None:
             MOVIEPILOT_CONTAINER,
             "rclone",
             "delete",
-            "MP:/",
+            f"{remote_name}:/",
             "--include",
-            ".islandbot-rclone-probe-*.txt",
+            f"{prefix}-*.txt",
             "--max-depth",
             "1",
             "--min-age",
@@ -154,10 +159,13 @@ def delete_probe(remote: str) -> bool:
     return result.returncode == 0
 
 
-def probe_remote() -> tuple[str, str]:
-    cleanup_stale_probes()
-    name = f".islandbot-rclone-probe-{os.getpid()}-{int(time.time())}.txt"
-    remote = f"MP:/{name}"
+def probe_remote(
+    remote_name: str = "MP",
+    prefix: str = ".islandbot-rclone-probe",
+) -> tuple[str, str]:
+    cleanup_stale_probes(remote_name, prefix)
+    name = f"{prefix}-{os.getpid()}-{int(time.time())}.txt"
+    remote = f"{remote_name}:/{name}"
     result = run(
         [
             "docker",
@@ -189,6 +197,91 @@ def probe_remote() -> tuple[str, str]:
         else:
             print("rclone probe cleanup deferred until the next check", flush=True)
     return status, output[-1000:]
+
+
+def moviepilot_alias_remote() -> str | None:
+    """Return the exact remote selected by MoviePilot's MP alias."""
+
+    try:
+        result = run(
+            [
+                "docker",
+                "exec",
+                MOVIEPILOT_CONTAINER,
+                "rclone",
+                "config",
+                "redacted",
+                "MP",
+            ],
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "remote":
+            return value.strip().removesuffix(":")
+    return None
+
+
+def recovery_probe_delay(status: str) -> int:
+    """Probe gdrive2 often enough to notify soon without API churn."""
+
+    if status == NETWORK:
+        return 15 * 60
+    if status in {AUTH, HEALTHY}:
+        return 6 * 60 * 60
+    return 30 * 60
+
+
+def monitor_gdrive2_recovery(state: dict, now: float) -> None:
+    """Notify once when gdrive2 becomes writable during a gdrive1 fallback."""
+
+    if moviepilot_alias_remote() != "gdrive1":
+        return
+
+    monitor = (
+        state.get("gdrive2_monitor")
+        if isinstance(state.get("gdrive2_monitor"), dict)
+        else {}
+    )
+    if now < float(monitor.get("next_probe") or 0):
+        return
+
+    old_status = str(monitor.get("status") or UNKNOWN)
+    seen_unhealthy = bool(monitor.get("seen_unhealthy", True))
+    recovery_notified = bool(monitor.get("recovery_notified", False))
+    status, output = probe_remote(RECOVERY_REMOTE, RECOVERY_PROBE_PREFIX)
+
+    if status != HEALTHY:
+        seen_unhealthy = True
+        recovery_notified = False
+    elif seen_unhealthy and not recovery_notified:
+        recovery_notified = notify(
+            "✅ gdrive2 共享云盘已恢复写入\n\n"
+            "极小文件写入探测已经成功。\n"
+            "MoviePilot 目前仍使用 gdrive1，系统没有自动切换。\n"
+            "请确认后再手动切回 gdrive2。\n"
+            "此通知不会自动删除。"
+        )
+
+    next_delay = recovery_probe_delay(status)
+    if status == HEALTHY and seen_unhealthy and not recovery_notified:
+        next_delay = 5 * 60
+    state["gdrive2_monitor"] = {
+        "status": status,
+        "next_probe": now + next_delay,
+        "last_probe": now,
+        "seen_unhealthy": seen_unhealthy,
+        "recovery_notified": recovery_notified,
+    }
+    print(
+        f"gdrive2 recovery probe status={status} previous={old_status} "
+        f"output={output[-300:].replace(chr(10), ' | ')}",
+        flush=True,
+    )
 
 
 def probe_delay(status: str, consecutive_failures: int) -> int:
@@ -329,7 +422,9 @@ def redo(history_id: int) -> tuple[bool, str]:
     return False, output[-500:] or f"退出码 {result.returncode}"
 
 
-def notify(text: str) -> None:
+def notify(text: str) -> bool:
+    """Send a persistent Telegram message that is never auto-deleted."""
+
     code = "import sys; from islandbot.app import OWNER,send; send(OWNER,sys.argv[1])"
     result = run(
         ["docker", "exec", BOT_CONTAINER, "python", "-c", code, text[:3500]],
@@ -337,6 +432,8 @@ def notify(text: str) -> None:
     )
     if result.returncode != 0:
         print("Telegram notification failed", flush=True)
+        return False
+    return True
 
 
 def _qbit_action(action: str, requested: list[str] | None = None) -> list[str]:
@@ -470,6 +567,8 @@ def process(dry_run: bool = False) -> None:
         print("MoviePilot upload active; probe and retry deferred", flush=True)
         return
 
+    monitor_gdrive2_recovery(state, now)
+
     old_backend = state.get("backend") if isinstance(state.get("backend"), dict) else {}
     old_status = str(old_backend.get("status") or UNKNOWN)
     status, probed, probe_output = refresh_backend(state, now)
@@ -581,6 +680,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--probe-gdrive2", action="store_true")
     args = parser.parse_args()
 
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -594,6 +694,13 @@ def main() -> None:
             status, output = probe_remote()
             print(
                 f"PROBE status={status} "
+                f"output={output[-500:].replace(chr(10), ' | ')}"
+            )
+            raise SystemExit(0 if status == HEALTHY else 1)
+        if args.probe_gdrive2:
+            status, output = probe_remote(RECOVERY_REMOTE, RECOVERY_PROBE_PREFIX)
+            print(
+                f"GDRIVE2_PROBE status={status} "
                 f"output={output[-500:].replace(chr(10), ' | ')}"
             )
             raise SystemExit(0 if status == HEALTHY else 1)

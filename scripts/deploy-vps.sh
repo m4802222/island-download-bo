@@ -5,7 +5,7 @@ bot_dir=/opt/media/downloadbot
 container=island-download-bot
 image=island-download-bot:1
 repository=m4802222/island-download-bo
-ref=${ISLAND_BOT_REF:-v2.6.7}
+ref=${ISLAND_BOT_REF:-v2.6.8}
 archive_url="https://codeload.github.com/$repository/tar.gz/$ref"
 workdir=$(mktemp -d /tmp/island-download-bot.XXXXXX)
 stamp=$(date +%Y%m%d%H%M%S)
@@ -291,7 +291,8 @@ assert SETTINGS.telegram_ui_engine in {"legacy", "aiogram_dialog"}
     restore_previous
 fi
 if ! docker exec "$container" rclone --config /rclone/rclone.conf \
-    config redacted MP | grep -Fxq 'remote = gdrive2:'; then
+    config redacted MP | grep -Eq '^remote = gdrive(1|2):$'; then
+    echo "MoviePilot MP 只能指向 gdrive1 或 gdrive2"
     restore_previous
 fi
 if ! gdrive2_policy=$(docker exec moviepilot rclone config redacted gdrive2); then

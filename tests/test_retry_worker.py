@@ -50,6 +50,65 @@ class RetryWorkerTests(unittest.TestCase):
         self.assertEqual(delete.call_count, 2)
         sleep.assert_called_once_with(3)
 
+    def test_gdrive2_recovery_notifies_once(self):
+        state = {
+            "gdrive2_monitor": {
+                "status": QUOTA,
+                "next_probe": 0,
+                "seen_unhealthy": True,
+                "recovery_notified": False,
+            }
+        }
+        with (
+            mock.patch.object(WORKER, "moviepilot_alias_remote", return_value="gdrive1"),
+            mock.patch.object(WORKER, "probe_remote", return_value=(HEALTHY, "")) as probe,
+            mock.patch.object(WORKER, "notify", return_value=True) as notify,
+        ):
+            WORKER.monitor_gdrive2_recovery(state, 1000)
+            WORKER.monitor_gdrive2_recovery(state, 1001)
+        probe.assert_called_once_with("gdrive2", WORKER.RECOVERY_PROBE_PREFIX)
+        notify.assert_called_once()
+        self.assertIn("gdrive2 共享云盘已恢复写入", notify.call_args.args[0])
+        self.assertTrue(state["gdrive2_monitor"]["recovery_notified"])
+
+    def test_gdrive2_failure_is_recorded_without_notification(self):
+        state = {}
+        with (
+            mock.patch.object(WORKER, "moviepilot_alias_remote", return_value="gdrive1"),
+            mock.patch.object(WORKER, "probe_remote", return_value=(QUOTA, "403")),
+            mock.patch.object(WORKER, "notify") as notify,
+        ):
+            WORKER.monitor_gdrive2_recovery(state, 1000)
+        notify.assert_not_called()
+        self.assertEqual(state["gdrive2_monitor"]["status"], QUOTA)
+        self.assertFalse(state["gdrive2_monitor"]["recovery_notified"])
+
+    def test_gdrive2_recovery_notification_failure_retries_in_five_minutes(self):
+        state = {
+            "gdrive2_monitor": {
+                "status": QUOTA,
+                "next_probe": 0,
+                "seen_unhealthy": True,
+                "recovery_notified": False,
+            }
+        }
+        with (
+            mock.patch.object(WORKER, "moviepilot_alias_remote", return_value="gdrive1"),
+            mock.patch.object(WORKER, "probe_remote", return_value=(HEALTHY, "")),
+            mock.patch.object(WORKER, "notify", return_value=False),
+        ):
+            WORKER.monitor_gdrive2_recovery(state, 1000)
+        self.assertEqual(state["gdrive2_monitor"]["next_probe"], 1300)
+        self.assertFalse(state["gdrive2_monitor"]["recovery_notified"])
+
+    def test_gdrive2_monitor_is_disabled_when_mp_is_not_on_fallback(self):
+        with (
+            mock.patch.object(WORKER, "moviepilot_alias_remote", return_value="gdrive2"),
+            mock.patch.object(WORKER, "probe_remote") as probe,
+        ):
+            WORKER.monitor_gdrive2_recovery({}, 1000)
+        probe.assert_not_called()
+
     def test_probe_backoff_is_progressive_and_bounded(self):
         self.assertEqual(WORKER.probe_delay(NETWORK, 1), 5 * 60)
         self.assertEqual(WORKER.probe_delay(NETWORK, 2), 15 * 60)

@@ -59,6 +59,13 @@ class DeploymentTests(unittest.TestCase):
         worker = (ROOT / "scripts" / "retry-moviepilot-rclone.py").read_text()
         self.assertIn("OnUnitActiveSec=1min", timer)
         self.assertIn("HEALTHY: (30 * 60,)", worker)
+        self.assertIn("gdrive2 共享云盘已恢复写入", worker)
+        self.assertIn("send(OWNER,sys.argv[1])", worker)
+        self.assertNotIn("send_temporary(OWNER,sys.argv[1])", worker)
+
+    def test_deploy_accepts_only_the_two_known_mp_targets(self):
+        script = (ROOT / "scripts" / "deploy-vps.sh").read_text()
+        self.assertIn("^remote = gdrive(1|2):$", script)
 
     def test_oauth_entrypoint_has_one_whitelisted_remote(self):
         script = (ROOT / "scripts" / "sync-rclone-oauth.sh").read_text()

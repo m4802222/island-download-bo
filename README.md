@@ -40,6 +40,7 @@ Google Drive 的媒体流程。
 - 普通中文消息接入本地 Ollama AI 助手；下载与删除仍须使用机器人操作确认
 - 下载队列：默认最多同时下载 2 个任务；默认预留 10GB 空间，空间不足时暂停并在清理后自动继续
 - 上传闸门每分钟执行一次，空闲且健康时每 30 分钟做一次极小写入探测；发现 Google 403、网络或 OAuth 异常后，在下一轮普通媒体上传失败前尽量提前暂停 qB 与 Aria2 普通下载
+- MoviePilot 临时回退到 `gdrive1` 时，继续独立探测 `gdrive2`；恢复写入后只发送一次不会自动删除的 Telegram 通知，不会自动切换云盘
 - MoviePilot 的 rclone 上传失败时保留源文件；网络错误按 5、15、30、60 分钟递增探测，Google 403 最长退避 6 小时，OAuth 失效不进行高频重试
 - 只有新的写入探测成功后才解除闸门；随后串行重试，且必须同时验证 MoviePilot 成功记录、目标路径存在及源/目标/远端文件大小一致，才允许清理普通任务
 - `学校救号`、`刷流*` 分类以及 `刷流*` 标签始终不暂停、不删除
@@ -51,7 +52,7 @@ Google Drive 的媒体流程。
 - 正式九分类文件由仓库 `config/category.yaml` 管理；每次部署先备份 MoviePilot
   当前文件，并记录版本、Git 提交号、部署时间和分类文件哈希
 - OAuth 同步只允许选择 `gdrive1` 或 `gdrive2`，且只替换对应的 `token`；
-  另一个账号和固定 `MP -> gdrive2:` 别名不会被改写
+  另一个账号和 `MP` 别名不会被改写
 
 ## 新版 Telegram 界面（预览）
 
@@ -115,14 +116,14 @@ TELEGRAM_UI_ENGINE=legacy
 3. 使用固定发布版部署：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.6.7/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+curl -fsSL https://raw.githubusercontent.com/m4802222/island-download-bo/v2.6.8/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
 bash /tmp/deploy-vps.sh
 ```
 
 部署脚本会先执行编译和测试，保留上一版源码用于失败回滚，并以目录方式将
 MoviePilot 的 rclone 配置挂载到 `/rclone:rw`，避免 OAuth 刷新后容器仍读取旧文件。
 部署完成后还会安装上传闸门/恢复定时器和每日健康检查定时器。部署会强制校验
-`MP -> gdrive2:`、gdrive2 的独立 client ID、共享云盘 ID、`stop_on_upload_limit = true`
+`MP -> gdrive1:` 或 `MP -> gdrive2:`、gdrive2 的独立 client ID、共享云盘 ID、`stop_on_upload_limit = true`
 以及 MoviePilot 仅有 1 个整理线程；任一条件不满足会自动恢复旧机器人。
 上传恢复只重试源文件仍存在的 rclone 上传失败记录。
 MoviePilot 已移动源文件时会继续阻止新普通下载，直到成功记录与云盘实时文件大小通过验证；

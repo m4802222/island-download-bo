@@ -15,6 +15,15 @@ SPEC.loader.exec_module(HEALTH)
 
 
 class HealthCheckTests(unittest.TestCase):
+    def test_mp_alias_reports_gdrive1_as_temporary_fallback(self):
+        result = subprocess.CompletedProcess(
+            [], 0, "[MP]\ntype = alias\nremote = gdrive1:\n", ""
+        )
+        with mock.patch.object(HEALTH, "run", return_value=result):
+            emoji, message = HEALTH.check_mp_alias()
+        self.assertEqual(emoji, "🟡")
+        self.assertIn("临时回退", message)
+
     def test_upload_policy_requires_remote_identity_limit_and_one_worker(self):
         remote = subprocess.CompletedProcess(
             [],
