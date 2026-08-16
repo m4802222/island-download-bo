@@ -97,6 +97,7 @@ TELEGRAM_UI_ENGINE=legacy
 - `islandbot/resolver.py`：MoviePilot/TMDB 的保守识别与人工确认。
 - `islandbot/library.py`：云盘和 MoviePilot 历史的精确缺集判断。
 - `islandbot/storage.py`：原子 JSON 状态和 v2 身份库。
+- `islandbot/state.py`：集中构造运行状态、状态文件和并发锁。
 - `islandbot/clients.py`：Telegram、Aria2、QAS、MoviePilot 适配器。
 - `islandbot/parsing.py`：Telegram 资源帖、夸克和磁力链接解析。
 - `islandbot/services/normalizer.py`：已完成任务的裸集数规范化和 staging 晋级。
@@ -106,6 +107,7 @@ TELEGRAM_UI_ENGINE=legacy
 - `islandbot/services/transfer.py`：MoviePilot 历史与上传成功证明读取。
 - `islandbot/services/quark.py`：QAS 夸克接口、目录遍历和缺集计划。
 - `islandbot/services/telegram_ui.py`：Telegram 消息、临时提示、按钮和回调确认。
+- `islandbot/services/maintenance.py`：后台维护调度、下载完成检测和 Aria2 完成处理。
 - `islandbot/aiogram_ui.py`：可选的 aiogram 3 + aiogram-dialog 界面适配层。
 - `islandbot/handlers.py`：Telegram 更新、按钮回调和旧命令路由。
 - `islandbot/runtime.py`：运行时状态、下载编排、服务轮询和清理流程。

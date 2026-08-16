@@ -38,8 +38,9 @@ from .media import (
 )
 from .resolver import MediaResolver, ResolutionError
 from .retry import cloud_block_status
-from .storage import IdentityStore, JsonStore
+from .state import RuntimeState
 from .services.normalizer import EpisodeNormalizer
+from .services.maintenance import MaintenanceService
 from .services.qbit_lifecycle import QBitLifecycle
 from .services.drive import DriveService
 from .services.cloud_drive_control import CloudDriveControl
@@ -80,70 +81,60 @@ OFFSET = 0
 PENDING = {}
 
 DATA_DIR = SETTINGS.data_dir
-DATA_DIR.mkdir(exist_ok=True)
-DONE_FILE = DATA_DIR / "done.json"
-DONE_STORE = JsonStore(DONE_FILE, {})
-# SEEN maps torrent-hash → unix timestamp of completion.
-# Old list format is migrated transparently on first load.
-_seen_raw = DONE_STORE.load()
-SEEN: dict[str, float] = (
-    {h: time.time() for h in _seen_raw if isinstance(h, str)}
-    if isinstance(_seen_raw, list)
-    else {h: float(t) for h, t in _seen_raw.items()
-          if isinstance(h, str) and isinstance(t, (int, float))}
-)
-del _seen_raw
-QUEUE_FILE = DATA_DIR / "queue.json"
-QUEUE_STORE = JsonStore(QUEUE_FILE, [])
-QUEUE = list(QUEUE_STORE.load())
-QUEUE_READY = QUEUE_FILE.exists()
+STATE = RuntimeState(DATA_DIR)
+DONE_FILE = STATE.done_store.path
+DONE_STORE = STATE.done_store
+SEEN = STATE.seen
+QUEUE_FILE = STATE.queue_file
+QUEUE_STORE = STATE.queue_store
+QUEUE = STATE.queue
+QUEUE_READY = STATE.queue_ready
 CLOUD_UPLOAD_BLOCK_FILE = DATA_DIR / "cloud-upload-block.json"
-BLOCKED_FILE = DATA_DIR / "blocked.json"
-BLOCKED_STORE = JsonStore(BLOCKED_FILE, [])
-BLOCKED = set(BLOCKED_STORE.load())
+BLOCKED_FILE = STATE.blocked_store.path
+BLOCKED_STORE = STATE.blocked_store
+BLOCKED = STATE.blocked
 RESERVE_GIB = SETTINGS.min_free_gib
 MAX_ACTIVE_DOWNLOADS = SETTINGS.max_active_downloads
 GIB = 1024 * 1024 * 1024
-EXPIRY_FILE = DATA_DIR / "expiry.json"
-EXPIRY_STORE = JsonStore(EXPIRY_FILE, [])
-EXPIRING = list(EXPIRY_STORE.load())
-INCOMING_DIR = DATA_DIR / "incoming"
-INCOMING_DIR.mkdir(exist_ok=True)
+EXPIRY_FILE = STATE.expiry_store.path
+EXPIRY_STORE = STATE.expiry_store
+EXPIRING = STATE.expiring
+INCOMING_DIR = STATE.incoming_dir
 MAX_TORRENT_BYTES = 20 * 1024 * 1024
-QUARK_QUEUE_FILE = DATA_DIR / "quark_queue.json"
-QUARK_QUEUE_STORE = JsonStore(QUARK_QUEUE_FILE, [])
-QUARK_QUEUE = list(QUARK_QUEUE_STORE.load())
-QUARK_PENDING_FILE = DATA_DIR / "quark_pending.json"
-QUARK_PENDING_STORE = JsonStore(QUARK_PENDING_FILE, {})
-QUARK_PENDING = QUARK_PENDING_STORE.load()
-QUARK_TITLE_PENDING_FILE = DATA_DIR / "quark_title_pending.json"
-QUARK_TITLE_PENDING_STORE = JsonStore(QUARK_TITLE_PENDING_FILE, {})
-QUARK_TITLE_PENDING = QUARK_TITLE_PENDING_STORE.load()
-QUARK_CONFIRM_PENDING_FILE = DATA_DIR / "quark_confirm_pending.json"
-QUARK_CONFIRM_PENDING_STORE = JsonStore(QUARK_CONFIRM_PENDING_FILE, {})
-QUARK_CONFIRM_PENDING = QUARK_CONFIRM_PENDING_STORE.load()
+QUARK_QUEUE_FILE = STATE.quark_queue_store.path
+QUARK_QUEUE_STORE = STATE.quark_queue_store
+QUARK_QUEUE = STATE.quark_queue
+QUARK_PENDING_FILE = STATE.quark_pending_store.path
+QUARK_PENDING_STORE = STATE.quark_pending_store
+QUARK_PENDING = STATE.quark_pending
+QUARK_TITLE_PENDING_FILE = STATE.quark_title_pending_store.path
+QUARK_TITLE_PENDING_STORE = STATE.quark_title_pending_store
+QUARK_TITLE_PENDING = STATE.quark_title_pending
+QUARK_CONFIRM_PENDING_FILE = STATE.quark_confirm_pending_store.path
+QUARK_CONFIRM_PENDING_STORE = STATE.quark_confirm_pending_store
+QUARK_CONFIRM_PENDING = STATE.quark_confirm_pending
 QUARK_ACTIVE = False
-QUARK_LOCK = threading.Lock()
+QUARK_LOCK = STATE.quark_lock
 # Protects QUEUE mutations that may occur from the Hermes background path
 # and the main polling loop at the same time.
-QUEUE_LOCK = threading.Lock()
+QUEUE_LOCK = STATE.queue_lock
 # Protects EXPIRING list from concurrent access by the AI-reply daemon
 # thread (send_temporary) and the main loop (delete_expired_messages).
-EXPIRING_LOCK = threading.Lock()
+EXPIRING_LOCK = STATE.expiring_lock
 # Tracks when each queued task first appeared at 0% progress.
 # Used to detect stalled downloads that never started.
 STALL_FIRST_SEEN: dict[str, float] = {}
 STALL_THRESHOLD = 30 * 60  # seconds at 0% before auto-pause
 STALL_NOTIFIED: set[str] = set()
-ARIA2_FILE = DATA_DIR / "aria2.json"
-ARIA2_STORE = JsonStore(ARIA2_FILE, {})
-ARIA2_TRACKED = ARIA2_STORE.load()
-ACCOUNT_PENDING_FILE = DATA_DIR / "account_pending.json"
-ACCOUNT_PENDING_STORE = JsonStore(ACCOUNT_PENDING_FILE, {})
-ACCOUNT_PENDING = ACCOUNT_PENDING_STORE.load()
-HERMES_INBOX_FILE = DATA_DIR / "hermes_inbox.json"
-HERMES_INBOX_LOCK = threading.Lock()
-IDENTITIES = IdentityStore(DATA_DIR / "identities-v2.json")
+ARIA2_FILE = STATE.aria2_store.path
+ARIA2_STORE = STATE.aria2_store
+ARIA2_TRACKED = STATE.aria2_tracked
+ACCOUNT_PENDING_FILE = STATE.account_pending_store.path
+ACCOUNT_PENDING_STORE = STATE.account_pending_store
+ACCOUNT_PENDING = STATE.account_pending
+HERMES_INBOX_FILE = STATE.hermes_inbox_file
+HERMES_INBOX_LOCK = STATE.hermes_inbox_lock
+IDENTITIES = STATE.identities
 RESOLVER = MediaResolver(
     MoviePilotClient(MOVIEPILOT_URL, MOVIEPILOT_TOKEN),
     IDENTITIES,
@@ -220,27 +211,27 @@ def json_request(url, payload, timeout=100):
 
 
 def save_quark_queue():
-    QUARK_QUEUE_STORE.save(QUARK_QUEUE)
+    STATE.save_quark_queue()
 
 
 def save_quark_pending():
-    QUARK_PENDING_STORE.save(QUARK_PENDING)
+    STATE.save_quark_pending()
 
 
 def save_quark_title_pending():
-    QUARK_TITLE_PENDING_STORE.save(QUARK_TITLE_PENDING)
+    STATE.save_quark_title_pending()
 
 
 def save_quark_confirm_pending():
-    QUARK_CONFIRM_PENDING_STORE.save(QUARK_CONFIRM_PENDING)
+    STATE.save_quark_confirm_pending()
 
 
 def save_aria2_tracked():
-    ARIA2_STORE.save(ARIA2_TRACKED)
+    STATE.save_aria2_tracked()
 
 
 def save_account_pending():
-    ACCOUNT_PENDING_STORE.save(ACCOUNT_PENDING)
+    STATE.save_account_pending()
 
 
 def hermes_jobs():
@@ -1193,20 +1184,7 @@ def cloud_drive_switch(chat_id, target):
 
 def service_tick():
     """Run one background maintenance cycle without polling Telegram updates."""
-    global LAST_CATEGORY_SYNC
-    now = time.monotonic()
-    if not LAST_CATEGORY_SYNC or now - LAST_CATEGORY_SYNC >= CATEGORY_SYNC_INTERVAL:
-        try:
-            synchronize_media_categories()
-        except Exception as exc:
-            print(f"media-category-sync error: {exc}", flush=True)
-            LAST_CATEGORY_SYNC = now - CATEGORY_SYNC_INTERVAL + CATEGORY_SYNC_RETRY_INTERVAL
-    process_hermes_inbox()
-    run_quark_queue()
-    watch_completed()
-    watch_aria2_completed()
-    cleanup_transferred_qbit_tasks()
-    delete_expired_messages()
+    MAINTENANCE.tick()
 
 
 def add_magnet(chat_id, user_id, magnet, source_message_id, media_title=None):
@@ -1389,32 +1367,8 @@ def handle(update):
 
 
 def watch_completed():
-    global SEEN
-    tasks = task_list()
-    renamed = normalize_completed_episode_files(tasks)
-    # qBittorrent may have changed file names or paths. Refresh the task list
-    # before promoting it into MoviePilot's watched directory.
-    if renamed:
-        tasks = task_list()
-    ready_tasks = prepare_completed_tasks(tasks)
-    ready_hashes = {str(item.get("hash") or "") for item in ready_tasks}
-    newly_done = [
-        item for item in ready_tasks
-        if item.get("progress", 0) >= 1 and item["hash"] not in SEEN
-    ]
-    transfer_triggered = bool(renamed and ready_hashes)
-    if newly_done or transfer_triggered:
-        try:
-            moviepilot_transfer_now()
-        except Exception as exc:
-            print(f"moviepilot-transfer-now error: {exc}", flush=True)
-        # Purge completions older than 30 days to keep done.json compact.
-        _cutoff = time.time() - 30 * 24 * 60 * 60
-        for item in newly_done:
-            SEEN[item["hash"]] = time.time()
-            DONE_STORE.save({h: t for h, t in SEEN.items() if t >= _cutoff})
-            send_temporary(OWNER, f"✅ 下载完成\n\n{item.get('name', '')}\n分类：{item.get('category') or '智能分类（MoviePilot）'}\n\nMoviePilot 将自动识别、整理并上传到 Google Drive。")
-    run_queue()
+    """Compatibility wrapper for completion monitoring."""
+    MAINTENANCE.watch_completed()
 
 
 def moviepilot_successful_proofs(candidates):
@@ -1441,40 +1395,40 @@ def cleanup_transferred_qbit_tasks():
 
 
 def watch_aria2_completed():
-    changed = False
-    for gid, tracked in list(ARIA2_TRACKED.items()):
-        try:
-            item = aria2_rpc("aria2.tellStatus", [gid, ["gid", "status", "errorMessage", "files"]])
-        except Exception as exc:
-            # Aria2 eventually forgets old stopped/completed GIDs. Keeping
-            # those entries forever only produces HTTP 400 on every polling
-            # cycle and makes real task failures difficult to see.
-            if "HTTP 400" in str(exc):
-                ARIA2_TRACKED.pop(gid, None)
-                changed = True
-                continue
-            print("aria2-watch error:", exc, flush=True)
-            continue
-        status = item.get("status")
-        if status == "complete" and not tracked.get("notified"):
-            tracked["notified"] = True
-            changed = True
-            try:
-                moviepilot_transfer_now()
-                result_text = "已通知 MoviePilot 立即识别、整理并上传 Google Drive。"
-            except Exception as exc:
-                print("moviepilot-transfer-now error:", exc, flush=True)
-                result_text = "MoviePilot 立即整理调用失败；文件仍保留在完成目录，请检查整理记录。"
-            send_temporary(
-                OWNER,
-                f"✅ Aria2 下载完成\n\n{tracked.get('name', aria2_name(item))}\n\n{result_text}",
-            )
-        elif status == "complete" and tracked.get("notified"):
-            ARIA2_TRACKED.pop(gid, None)
-            changed = True
-        elif status == "error":
-            send(OWNER, f"⚠️ Aria2 下载失败\n\n{tracked.get('name', aria2_name(item))}\n{item.get('errorMessage') or '请在我的任务中检查。'}")
-            ARIA2_TRACKED.pop(gid, None)
-            changed = True
-    if changed:
-        save_aria2_tracked()
+    """Compatibility wrapper for Aria2 completion monitoring."""
+    MAINTENANCE.watch_aria2_completed()
+
+
+def _set_last_category_sync(value):
+    global LAST_CATEGORY_SYNC
+    LAST_CATEGORY_SYNC = value
+
+
+MAINTENANCE = MaintenanceService(
+    monotonic=time.monotonic,
+    wall_time=time.time,
+    get_last_category_sync=lambda: LAST_CATEGORY_SYNC,
+    set_last_category_sync=_set_last_category_sync,
+    category_sync_interval=CATEGORY_SYNC_INTERVAL,
+    category_sync_retry_interval=CATEGORY_SYNC_RETRY_INTERVAL,
+    synchronize_categories=lambda: synchronize_media_categories(),
+    process_inbox=lambda: process_hermes_inbox(),
+    run_quark_queue=lambda: run_quark_queue(),
+    task_list=lambda: task_list(),
+    normalize_completed=lambda tasks: normalize_completed_episode_files(tasks),
+    prepare_completed=lambda tasks: prepare_completed_tasks(tasks),
+    trigger_transfer=lambda: moviepilot_transfer_now(),
+    run_download_queue=lambda: run_queue(),
+    send_temporary=lambda owner, text: send_temporary(owner, text),
+    owner=OWNER,
+    seen=SEEN,
+    save_seen=lambda value: DONE_STORE.save(value),
+    aria_tracked=ARIA2_TRACKED,
+    aria_rpc=lambda method, params: aria2_rpc(method, params),
+    aria_name=lambda item: aria2_name(item),
+    send=lambda owner, text: send(owner, text),
+    save_aria_tracked=lambda: save_aria2_tracked(),
+    cleanup_transferred=lambda: cleanup_transferred_qbit_tasks(),
+    delete_expired=lambda: delete_expired_messages(),
+    log=lambda message: print(message, flush=True),
+)
